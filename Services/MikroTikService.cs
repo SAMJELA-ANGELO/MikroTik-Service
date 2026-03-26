@@ -9,7 +9,7 @@ namespace MikrotikService.Services
 {
     public class MikrotikService
     {
-        private readonly string host = "192.168.1.154";
+        private readonly string host = "10.0.0.2";
         private readonly string user = "admin";
         private readonly string pass = "To2day";
 

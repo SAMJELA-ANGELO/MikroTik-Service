@@ -1,4 +1,4 @@
-@MikrotikService_HostAddress = http://localhost:5174
+@MikrotikService_HostAddress = http://localhost:5000
 
 GET {{MikrotikService_HostAddress}}/weatherforecast/
 Accept: application/json
