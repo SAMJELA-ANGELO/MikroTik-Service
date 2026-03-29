@@ -12,11 +12,25 @@ namespace MikrotikService.Services
         private readonly string host = "10.0.0.2";
         private readonly string user = "admin";
         private readonly string pass = "To2day";
+        
+        // Multi-router support (for failover)
+        private readonly string[] routerIPs = new[] { "10.0.0.2", "10.0.0.3" }; // Home: 10.0.0.2, School: 10.0.0.3
+        private readonly string[] routerNames = new[] { "Home", "School" }; // Router names for logging
 
         private ITikConnection Connect()
         {
             var connection = ConnectionFactory.CreateConnection(TikConnectionType.Api);
             connection.Open(host, user, pass);
+            return connection;
+        }
+
+        /// <summary>
+        /// Connect to a specific router by IP address
+        /// </summary>
+        private ITikConnection ConnectToRouter(string routerIP)
+        {
+            var connection = ConnectionFactory.CreateConnection(TikConnectionType.Api);
+            connection.Open(routerIP, user, pass);
             return connection;
         }
 
@@ -316,6 +330,482 @@ namespace MikrotikService.Services
         {
             using var connection = Connect();
             return connection.LoadAll<HotspotActive>().ToList();
+        }
+
+        public void BindMacToBypass(string macAddress, int durationHours)
+        {
+            if (string.IsNullOrWhiteSpace(macAddress))
+                throw new ArgumentException("MAC address is required");
+
+            using var connection = Connect();
+
+            try
+            {
+                // Check if binding already exists
+                var existingBindings = connection.LoadList<dynamic>(
+                    connection.CreateParameter("mac-address", macAddress)
+                ).ToList();
+
+                // Remove old binding if exists
+                if (existingBindings != null && existingBindings.Count > 0)
+                {
+                    var bindingCommand = connection.CreateCommand("/ip/hotspot/ip-binding/remove");
+                    bindingCommand.AddParameter(".id", existingBindings[0].Id);
+                    try
+                    {
+                        bindingCommand.ExecuteNonQuery();
+                    }
+                    catch (Exception ex)
+                    {
+                        if (!IsEmptyResponseException(ex))
+                            throw;
+                    }
+                }
+
+                // Add new binding with bypass type
+                var addCommand = connection.CreateCommand("/ip/hotspot/ip-binding/add");
+                addCommand.AddParameter("mac-address", macAddress);
+                addCommand.AddParameter("type", "bypassed");
+                if (durationHours > 0)
+                {
+                    addCommand.AddParameter("timeout", $"{durationHours}h");
+                }
+
+                try
+                {
+                    addCommand.ExecuteNonQuery();
+                }
+                catch (Exception ex)
+                {
+                    if (!IsEmptyResponseException(ex))
+                        throw;
+                }
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException($"Failed to bind MAC address {macAddress} to bypass: {ex.Message}", ex);
+            }
+        }
+
+        public void UnbindMac(string macAddress)
+        {
+            if (string.IsNullOrWhiteSpace(macAddress))
+                throw new ArgumentException("MAC address is required");
+
+            using var connection = Connect();
+
+            try
+            {
+                // Find and remove the binding
+                var bindings = connection.LoadList<dynamic>(
+                    connection.CreateParameter("mac-address", macAddress)
+                ).ToList();
+
+                if (bindings != null && bindings.Count > 0)
+                {
+                    var removeCommand = connection.CreateCommand("/ip/hotspot/ip-binding/remove");
+                    removeCommand.AddParameter(".id", bindings[0].Id);
+
+                    try
+                    {
+                        removeCommand.ExecuteNonQuery();
+                    }
+                    catch (Exception ex)
+                    {
+                        if (!IsEmptyResponseException(ex))
+                            throw;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException($"Failed to unbind MAC address {macAddress}: {ex.Message}", ex);
+            }
+        }
+
+        /// <summary>
+        /// FAILOVER METHOD: Tries to activate a user on the first available router (Home then School)
+        /// Used for the "mobile Starlink" scenario where only one router is online at a time
+        /// </summary>
+        public string ActivateOnAvailableRouter(string username, int durationHours, string? macAddress = null)
+        {
+            if (string.IsNullOrWhiteSpace(username))
+                throw new ArgumentException("Username is required");
+
+            List<string> errors = new List<string>();
+            string? successfulRouter = null;
+
+            // Try each router in order
+            for (int i = 0; i < routerIPs.Length; i++)
+            {
+                string routerIP = routerIPs[i];
+                string routerName = routerNames.Length > i ? routerNames[i] : $"Router-{i}";
+
+                try
+                {
+                    Console.WriteLine($"🔄 Attempting to activate {username} on {routerName} ({routerIP})...");
+                    
+                    using var connection = ConnectToRouter(routerIP);
+                    
+                    // Try to activate the user
+                    ActivateUserOnConnection(connection, username, durationHours);
+                    
+                    // If we get here, connection was successful
+                    successfulRouter = routerName;
+                    Console.WriteLine($"✅ Successfully activated {username} on {routerName}");
+
+                    // If MAC address provided, also bind it
+                    if (!string.IsNullOrWhiteSpace(macAddress))
+                    {
+                        try
+                        {
+                            BindMacOnConnection(connection, macAddress, durationHours);
+                            Console.WriteLine($"✅ Successfully bound MAC {macAddress} on {routerName}");
+                        }
+                        catch (Exception macError)
+                        {
+                            Console.WriteLine($"⚠️ MAC binding warning on {routerName} (non-critical): {macError.Message}");
+                            // Don't fail activation if MAC binding fails
+                        }
+                    }
+
+                    return successfulRouter;
+                }
+                catch (Exception ex)
+                {
+                    string errorMsg = $"{routerName} ({routerIP}): {ex.Message}";
+                    errors.Add(errorMsg);
+                    Console.WriteLine($"❌ Failed on {routerName}: {ex.Message}");
+                    // Continue to next router
+                }
+            }
+
+            // If we get here, all routers failed
+            throw new Exception(
+                $"Failed to activate {username} on any available router. Errors:\n" +
+                string.Join("\n", errors)
+            );
+        }
+
+        /// <summary>
+        /// GIFT FLOW METHOD: Creates hotspot user WITHOUT instant MAC binding
+        /// Recipient will log in manually; MAC will be captured on first login
+        /// Used when one user buys a bundle for another user
+        /// </summary>
+        public string CreateHotspotUserOnly(string username, int durationHours)
+        {
+            if (string.IsNullOrWhiteSpace(username))
+                throw new ArgumentException("Username is required");
+
+            List<string> errors = new List<string>();
+            string? successfulRouter = null;
+
+            // Try each router in order
+            for (int i = 0; i < routerIPs.Length; i++)
+            {
+                string routerIP = routerIPs[i];
+                string routerName = routerNames.Length > i ? routerNames[i] : $"Router-{i}";
+
+                try
+                {
+                    Console.WriteLine($"🎁 Attempting to create hotspot user {username} on {routerName} ({routerIP})...");
+                    
+                    using var connection = ConnectToRouter(routerIP);
+                    
+                    // Try to activate the user (creates hotspot account with limit-uptime)
+                    ActivateUserOnConnection(connection, username, durationHours);
+                    
+                    // If we get here, connection was successful
+                    successfulRouter = routerName;
+                    Console.WriteLine($"✅ Successfully created hotspot user {username} on {routerName}");
+                    Console.WriteLine($"   Recipient will log in manually; MAC binding will happen on first login");
+
+                    return successfulRouter;
+                }
+                catch (Exception ex)
+                {
+                    string errorMsg = $"{routerName} ({routerIP}): {ex.Message}";
+                    errors.Add(errorMsg);
+                    Console.WriteLine($"❌ Failed on {routerName}: {ex.Message}");
+                    // Continue to next router
+                }
+            }
+
+            // If we get here, all routers failed
+            throw new Exception(
+                $"Failed to create hotspot user {username} on any available router. Errors:\n" +
+                string.Join("\n", errors)
+            );
+        }
+
+        /// <summary>
+        /// FAILOVER METHOD: Tries to bind MAC on the first available router (Home then School)
+        /// </summary>
+        public string BindMacOnAvailableRouter(string macAddress, int durationHours = 0)
+        {
+            if (string.IsNullOrWhiteSpace(macAddress))
+                throw new ArgumentException("MAC address is required");
+
+            List<string> errors = new List<string>();
+
+            // Try each router in order
+            for (int i = 0; i < routerIPs.Length; i++)
+            {
+                string routerIP = routerIPs[i];
+                string routerName = routerNames.Length > i ? routerNames[i] : $"Router-{i}";
+
+                try
+                {
+                    Console.WriteLine($"🔄 Attempting to bind MAC {macAddress} on {routerName} ({routerIP})...");
+                    
+                    using var connection = ConnectToRouter(routerIP);
+                    
+                    // Try to bind the MAC
+                    BindMacOnConnection(connection, macAddress, durationHours);
+                    
+                    Console.WriteLine($"✅ Successfully bound MAC on {routerName}");
+                    return routerName;
+                }
+                catch (Exception ex)
+                {
+                    string errorMsg = $"{routerName} ({routerIP}): {ex.Message}";
+                    errors.Add(errorMsg);
+                    Console.WriteLine($"❌ Failed on {routerName}: {ex.Message}");
+                    // Continue to next router
+                }
+            }
+
+            // If we get here, all routers failed
+            throw new Exception(
+                $"Failed to bind MAC {macAddress} on any available router. Errors:\n" +
+                string.Join("\n", errors)
+            );
+        }
+
+        /// <summary>
+        /// FAILOVER METHOD: Tries to unbind MAC on Available routers (tries both Home and School)
+        /// Used when session expires - MAC might exist on either router
+        /// </summary>
+        public void UnbindMacOnAvailableRouters(string macAddress)
+        {
+            if (string.IsNullOrWhiteSpace(macAddress))
+                throw new ArgumentException("MAC address is required");
+
+            Console.WriteLine($"🔍 Searching for MAC {macAddress} on available routers...");
+            bool foundOnAnyRouter = false;
+
+            // Try each router - don't fail if one doesn't have it
+            for (int i = 0; i < routerIPs.Length; i++)
+            {
+                string routerIP = routerIPs[i];
+                string routerName = routerNames.Length > i ? routerNames[i] : $"Router-{i}";
+
+                try
+                {
+                    using var connection = ConnectToRouter(routerIP);
+                    
+                    // Try to find and remove the binding
+                    var bindings = connection.LoadList<dynamic>(
+                        connection.CreateParameter("mac-address", macAddress)
+                    ).ToList();
+
+                    if (bindings != null && bindings.Count > 0)
+                    {
+                        var removeCommand = connection.CreateCommand("/ip/hotspot/ip-binding/remove");
+                        removeCommand.AddParameter(".id", bindings[0].Id);
+
+                        try
+                        {
+                            removeCommand.ExecuteNonQuery();
+                            Console.WriteLine($"✅ Removed MAC binding from {routerName}");
+                            foundOnAnyRouter = true;
+                        }
+                        catch (Exception ex)
+                        {
+                            if (!IsEmptyResponseException(ex))
+                                throw;
+                        }
+                    }
+                    else
+                    {
+                        Console.WriteLine($"ℹ️ MAC not found on {routerName}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"⚠️ Could not check {routerName}: {ex.Message}");
+                    // Continue checking other routers
+                }
+            }
+
+            if (!foundOnAnyRouter)
+            {
+                Console.WriteLine($"⚠️ MAC {macAddress} not found on any router (may already be removed)");
+            }
+        }
+
+        /// <summary>
+        /// Helper method: Activate user on a given connection
+        /// </summary>
+        private void ActivateUserOnConnection(ITikConnection connection, string username, int durationHours)
+        {
+            List<HotspotUser> users;
+            try
+            {
+                users = connection.LoadList<HotspotUser>(connection.CreateParameter("name", username)).ToList();
+            }
+            catch (Exception ex)
+            {
+                if (IsEmptyResponseException(ex))
+                {
+                    users = new List<HotspotUser>();
+                }
+                else
+                    throw;
+            }
+
+            var profile = $"profile-{durationHours}h";
+            
+            // Ensure the requested profile exists 
+            EnsureProfileExistsOnConnection(connection, profile);
+            
+            // Execute set or add
+            if (users.Count > 0)
+            {
+                var user = users.First();
+
+                var setCommand = connection.CreateCommand("/ip/hotspot/user/set");
+                setCommand.AddParameter(".id", user.Id);
+                setCommand.AddParameter("profile", profile);
+                setCommand.AddParameter("limit-uptime", $"{durationHours}h");
+                setCommand.AddParameter("disabled", "no");
+
+                try
+                {
+                    setCommand.ExecuteNonQuery();
+                }
+                catch (Exception ex)
+                {
+                    if (!IsEmptyResponseException(ex))
+                        throw;
+                }
+            }
+            else
+            {
+                var addCommand = connection.CreateCommand("/ip/hotspot/user/add");
+                addCommand.AddParameter("name", username);
+                addCommand.AddParameter("password", username);
+                addCommand.AddParameter("profile", profile);
+                addCommand.AddParameter("limit-uptime", $"{durationHours}h");
+
+                try
+                {
+                    addCommand.ExecuteNonQuery();
+                }
+                catch (Exception ex)
+                {
+                    if (!IsEmptyResponseException(ex))
+                        throw;
+                }
+            }
+
+            // Verification
+            try
+            {
+                var verified = connection.LoadList<HotspotUser>(connection.CreateParameter("name", username)).FirstOrDefault();
+                if (verified == null)
+                {
+                    throw new InvalidOperationException($"Failed to verify activation: user '{username}' not found after operation");
+                }
+            }
+            catch (Exception ex)
+            {
+                if (IsEmptyResponseException(ex))
+                {
+                    throw new InvalidOperationException("Activation inconclusive: device returned '!empty' during verification.");
+                }
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Helper method: Bind MAC on a given connection
+        /// </summary>
+        private void BindMacOnConnection(ITikConnection connection, string macAddress, int durationHours)
+        {
+            try
+            {
+                // Check if binding already exists
+                var existingBindings = connection.LoadList<dynamic>(
+                    connection.CreateParameter("mac-address", macAddress)
+                ).ToList();
+
+                // Remove old binding if exists
+                if (existingBindings != null && existingBindings.Count > 0)
+                {
+                    var bindingCommand = connection.CreateCommand("/ip/hotspot/ip-binding/remove");
+                    bindingCommand.AddParameter(".id", existingBindings[0].Id);
+                    try
+                    {
+                        bindingCommand.ExecuteNonQuery();
+                    }
+                    catch (Exception ex)
+                    {
+                        if (!IsEmptyResponseException(ex))
+                            throw;
+                    }
+                }
+
+                // Add new binding with bypass type
+                var addCommand = connection.CreateCommand("/ip/hotspot/ip-binding/add");
+                addCommand.AddParameter("mac-address", macAddress);
+                addCommand.AddParameter("type", "bypassed");
+                if (durationHours > 0)
+                {
+                    addCommand.AddParameter("timeout", $"{durationHours}h");
+                }
+
+                try
+                {
+                    addCommand.ExecuteNonQuery();
+                }
+                catch (Exception ex)
+                {
+                    if (!IsEmptyResponseException(ex))
+                        throw;
+                }
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException($"Failed to bind MAC address {macAddress} to bypass: {ex.Message}", ex);
+            }
+        }
+
+        /// <summary>
+        /// Helper method: Ensure profile exists on a given connection
+        /// </summary>
+        private void EnsureProfileExistsOnConnection(ITikConnection connection, string profileName)
+        {
+            if (connection == null || string.IsNullOrWhiteSpace(profileName))
+                return;
+
+            try
+            {
+                var addProfile = connection.CreateCommand("/ip/hotspot/user/profile/add");
+                addProfile.AddParameter("name", profileName);
+                addProfile.ExecuteNonQuery();
+            }
+            catch (Exception ex)
+            {
+                if (IsEmptyResponseException(ex))
+                    return;
+
+                var msg = ex.Message ?? string.Empty;
+                if (msg.Contains("already") || msg.Contains("exists") || msg.Contains("duplicate"))
+                    return;
+
+                throw;
+            }
         }
     }
 }
