@@ -75,6 +75,23 @@ namespace MikrotikService.Services
             return false;
         }
 
+        /// <summary>
+        /// Safe wrapper for ExecuteList that treats !empty response as empty results instead of throwing
+        /// </summary>
+        private IEnumerable<ITikReSentence> SafeExecuteList(ITikCommand cmd)
+        {
+            try
+            {
+                return cmd.ExecuteList();
+            }
+            catch (Exception ex) when (IsEmptyResponseException(ex))
+            {
+                // MikroTik returned !empty - no results found, which is fine
+                // Treat this as an empty list instead of crashing
+                return Enumerable.Empty<ITikReSentence>();
+            }
+        }
+
         public void ActivateUser(string username, int durationHours)
         {
             if (string.IsNullOrWhiteSpace(username))
@@ -771,17 +788,8 @@ namespace MikrotikService.Services
                     printCmd.AddParameter(".proplist", ".id");
                     printCmd.AddParameter("?mac-address", macAddress);
                     
-                    List<ITikReSentence> bindings = new List<ITikReSentence>();
-                    try
-                    {
-                        bindings = printCmd.ExecuteList().ToList();
-                        Console.WriteLine($"   Found {bindings.Count} binding(s) for MAC {macAddress}");
-                    }
-                    catch (Exception ex) when (IsEmptyResponseException(ex))
-                    {
-                        Console.WriteLine($"   ℹ️ No bindings found for MAC {macAddress} (empty response)");
-                        bindings = new List<ITikReSentence>();
-                    }
+                    var bindings = SafeExecuteList(printCmd).ToList();
+                    Console.WriteLine($"   Found {bindings.Count} binding(s) for MAC {macAddress}");
 
                     if (bindings != null && bindings.Count > 0)
                     {
@@ -936,17 +944,8 @@ namespace MikrotikService.Services
                 printCmd.AddParameter(".proplist", ".id");
                 printCmd.AddParameter("?mac-address", macAddress);
                 
-                List<ITikReSentence> results = new List<ITikReSentence>();
-                try
-                {
-                    results = printCmd.ExecuteList().ToList();
-                    Console.WriteLine($"   ✅ MAC binding check complete: found {results.Count} existing binding(s)");
-                }
-                catch (Exception ex) when (IsEmptyResponseException(ex))
-                {
-                    Console.WriteLine("   ℹ️ No existing bindings found (empty response) - will create new one");
-                    results = new List<ITikReSentence>();
-                }
+                var results = SafeExecuteList(printCmd).ToList();
+                Console.WriteLine($"   ✅ MAC binding check complete: found {results.Count} existing binding(s)");
 
                 // Remove old binding if exists
                 if (results.Count > 0)
