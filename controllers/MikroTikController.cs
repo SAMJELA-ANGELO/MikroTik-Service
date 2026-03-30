@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Mvc;
 using MikrotikService.Services;
 using tik4net.Objects.Ip.Hotspot;
+using Microsoft.Extensions.Logging;
 
 namespace MikrotikService.Controllers
 {
@@ -9,10 +10,12 @@ namespace MikrotikService.Controllers
     public class MikrotikController : ControllerBase
     {
         private readonly Services.MikrotikService _service;
+        private readonly ILogger<MikrotikController> _logger;
 
-        public MikrotikController(Services.MikrotikService service)
+        public MikrotikController(Services.MikrotikService service, ILogger<MikrotikController> logger)
         {
             _service = service;
+            _logger = logger;
         }
 
         [HttpGet("test-connection")]
@@ -254,14 +257,21 @@ namespace MikrotikService.Controllers
         [HttpPost("activate-failover")]
         public IActionResult ActivateFailover([FromBody] ActivateDto dto)
         {
+            _logger.LogInformation("📥 [ActivateFailover] Endpoint called: username={username}, durationHours={durationHours}, mac={mac}", 
+                dto.Username, dto.DurationHours, dto.MacAddress ?? "null");
+            
             if (string.IsNullOrWhiteSpace(dto.Username))
             {
+                _logger.LogWarning("⚠️ [ActivateFailover] Missing username");
                 return BadRequest(new { message = "Username is required" });
             }
 
             try
             {
+                _logger.LogInformation("🚀 [ActivateFailover] Calling service.ActivateOnAvailableRouter...");
                 string useRouter = _service.ActivateOnAvailableRouter(dto.Username, dto.DurationHours, dto.MacAddress);
+                _logger.LogInformation("✅ [ActivateFailover] Success on router: {router}", useRouter);
+                
                 return Ok(new { 
                     message = $"User {dto.Username} activated for {dto.DurationHours} hours",
                     activeRouter = useRouter,
@@ -270,6 +280,7 @@ namespace MikrotikService.Controllers
             }
             catch (Exception ex)
             {
+                _logger.LogError(ex, "❌ [ActivateFailover] Error: {message}", ex.Message);
                 return StatusCode(503, new { 
                     message = "No MikroTik routers currently available", 
                     error = ex.Message,
@@ -285,14 +296,21 @@ namespace MikrotikService.Controllers
         [HttpPost("create-hotspot-user")]
         public IActionResult CreateHotspotUserOnly([FromBody] CreateHotspotUserDto dto)
         {
+            _logger.LogInformation("📥 [CreateHotspotUserOnly] Endpoint called: username={username}, durationHours={durationHours}", 
+                dto.Username, dto.DurationHours);
+            
             if (string.IsNullOrWhiteSpace(dto.Username))
             {
+                _logger.LogWarning("⚠️ [CreateHotspotUserOnly] Missing username");
                 return BadRequest(new { message = "Username is required" });
             }
 
             try
             {
+                _logger.LogInformation("🎁 [CreateHotspotUserOnly] Calling service.CreateHotspotUserOnly...");
                 string activeRouter = _service.CreateHotspotUserOnly(dto.Username, dto.DurationHours);
+                _logger.LogInformation("✅ [CreateHotspotUserOnly] Success on router: {router}", activeRouter);
+                
                 return Ok(new { 
                     message = $"Hotspot user {dto.Username} created for {dto.DurationHours} hours (gift - no MAC binding)",
                     activeRouter = activeRouter,
@@ -301,6 +319,7 @@ namespace MikrotikService.Controllers
             }
             catch (Exception ex)
             {
+                _logger.LogError(ex, "❌ [CreateHotspotUserOnly] Error: {message}", ex.Message);
                 return StatusCode(503, new { 
                     message = "No MikroTik routers currently available", 
                     error = ex.Message,
@@ -315,14 +334,21 @@ namespace MikrotikService.Controllers
         [HttpPost("bind-mac-failover")]
         public IActionResult BindMacFailover([FromBody] BindMacDto dto)
         {
+            _logger.LogInformation("📥 [BindMacFailover] Endpoint called: mac={mac}, durationHours={durationHours}", 
+                dto.MacAddress, dto.DurationHours ?? 0);
+            
             if (string.IsNullOrWhiteSpace(dto.MacAddress))
             {
+                _logger.LogWarning("⚠️ [BindMacFailover] Missing MAC address");
                 return BadRequest(new { message = "MAC address is required" });
             }
 
             try
             {
+                _logger.LogInformation("📌 [BindMacFailover] Calling service.BindMacOnAvailableRouter...");
                 string activeRouter = _service.BindMacOnAvailableRouter(dto.MacAddress, dto.DurationHours ?? 0);
+                _logger.LogInformation("✅ [BindMacFailover] Success on router: {router}", activeRouter);
+                
                 return Ok(new { 
                     message = $"MAC address {dto.MacAddress} bound to bypass list",
                     activeRouter = activeRouter
@@ -330,6 +356,7 @@ namespace MikrotikService.Controllers
             }
             catch (Exception ex)
             {
+                _logger.LogError(ex, "❌ [BindMacFailover] Error: {message}", ex.Message);
                 return StatusCode(503, new { 
                     message = "No MikroTik routers currently available", 
                     error = ex.Message 
@@ -368,15 +395,22 @@ namespace MikrotikService.Controllers
         [HttpPost("silent-login")]
         public IActionResult SilentLogin([FromBody] SilentLoginDto dto)
         {
+            _logger.LogInformation("📥 [SilentLogin] Endpoint called: username={username}, mac={mac}, ip={ip}", 
+                dto.Username, dto.MacAddress, dto.IpAddress);
+            
             if (string.IsNullOrWhiteSpace(dto.Username) || string.IsNullOrWhiteSpace(dto.Password) ||
                 string.IsNullOrWhiteSpace(dto.MacAddress) || string.IsNullOrWhiteSpace(dto.IpAddress))
             {
+                _logger.LogWarning("⚠️ [SilentLogin] Missing required parameters");
                 return BadRequest(new { message = "Username, password, MAC address, and IP address are required" });
             }
 
             try
             {
+                _logger.LogInformation("🔐 [SilentLogin] Calling service.SilentLogin...");
                 string activeRouter = _service.SilentLogin(dto.Username, dto.Password, dto.MacAddress, dto.IpAddress, dto.DurationHours);
+                _logger.LogInformation("✅ [SilentLogin] Success on router: {router}", activeRouter);
+                
                 return Ok(new { 
                     message = $"Silent login successful for {dto.Username}",
                     activeRouter = activeRouter,
@@ -385,6 +419,7 @@ namespace MikrotikService.Controllers
             }
             catch (Exception ex)
             {
+                _logger.LogError(ex, "❌ [SilentLogin] Error: {message}", ex.Message);
                 return StatusCode(503, new { 
                     message = "Silent login failed on all MikroTik routers", 
                     error = ex.Message,

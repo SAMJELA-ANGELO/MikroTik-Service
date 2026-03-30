@@ -4,6 +4,7 @@ using tik4net.Objects;
 using tik4net.Objects.Ip.Hotspot;
 using tik4net.Objects.System;
 using System.Linq;
+using Microsoft.Extensions.Logging;
 
 namespace MikrotikService.Services
 {
@@ -16,12 +17,30 @@ namespace MikrotikService.Services
         // Multi-router support (for failover)
         private readonly string[] routerIPs = new[] { "10.0.0.2", "10.0.0.3", "192.168.1.154" }; // Home: 10.0.0.2, School: 10.0.0.3, Local: 192.168.1.154
         private readonly string[] routerNames = new[] { "Home", "School", "Local" }; // Router names for logging
+        
+        private readonly ILogger<MikrotikService> _logger;
+
+        public MikrotikService(ILogger<MikrotikService> logger)
+        {
+            _logger = logger;
+            _logger.LogInformation("🔧 MikrotikService initialized");
+        }
 
         private ITikConnection Connect()
         {
-            var connection = ConnectionFactory.CreateConnection(TikConnectionType.Api);
-            connection.Open(host, user, pass);
-            return connection;
+            _logger.LogInformation("📡 Attempting to connect to MikroTik (default: {host})", host);
+            try
+            {
+                var connection = ConnectionFactory.CreateConnection(TikConnectionType.Api);
+                connection.Open(host, user, pass);
+                _logger.LogInformation("✅ Connected to MikroTik {host} successfully", host);
+                return connection;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "❌ Failed to connect to MikroTik {host}: {message}", host, ex.Message);
+                throw;
+            }
         }
 
         /// <summary>
@@ -29,9 +48,19 @@ namespace MikrotikService.Services
         /// </summary>
         private ITikConnection ConnectToRouter(string routerIP)
         {
-            var connection = ConnectionFactory.CreateConnection(TikConnectionType.Api);
-            connection.Open(routerIP, user, pass);
-            return connection;
+            _logger.LogInformation("📡 Attempting to connect to router IP: {routerIP}", routerIP);
+            try
+            {
+                var connection = ConnectionFactory.CreateConnection(TikConnectionType.Api);
+                connection.Open(routerIP, user, pass);
+                _logger.LogInformation("✅ Connected to router {routerIP} successfully", routerIP);
+                return connection;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "❌ Failed to connect to router {routerIP}: {message}", routerIP, ex.Message);
+                throw;
+            }
         }
 
         private bool IsEmptyResponseException(Exception? ex)
@@ -479,6 +508,8 @@ namespace MikrotikService.Services
         /// </summary>
         public string ActivateOnAvailableRouter(string username, int durationHours, string? macAddress = null)
         {
+            _logger.LogInformation("🚀 ActivateOnAvailableRouter START: username={username}, duration={durationHours}h, mac={macAddress}", username, durationHours, macAddress ?? "null");
+            
             if (string.IsNullOrWhiteSpace(username))
                 throw new ArgumentException("Username is required");
 
@@ -491,46 +522,53 @@ namespace MikrotikService.Services
                 string routerIP = routerIPs[i];
                 string routerName = routerNames.Length > i ? routerNames[i] : $"Router-{i}";
 
+                _logger.LogInformation("🔄 [{routerName}] Attempting to activate {username}...", routerName, username);
+
                 try
                 {
-                    Console.WriteLine($"🔄 Attempting to activate {username} on {routerName} ({routerIP})...");
-                    
                     using var connection = ConnectToRouter(routerIP);
+                    _logger.LogInformation("✅ [{routerName}] Connected successfully", routerName);
                     
                     // Try to activate the user
+                    _logger.LogInformation("   Step 1/2: Creating/updating hotspot user...");
                     ActivateUserOnConnection(connection, username, durationHours);
+                    _logger.LogInformation("   ✅ Hotspot user ready");
                     
                     // If we get here, connection was successful
                     successfulRouter = routerName;
-                    Console.WriteLine($"✅ Successfully activated {username} on {routerName}");
+                    _logger.LogInformation("✅ [{routerName}] Successfully activated {username}", routerName, username);
 
                     // If MAC address provided, also bind it
                     if (!string.IsNullOrWhiteSpace(macAddress))
                     {
                         try
                         {
+                            _logger.LogInformation("   Step 2/2: Binding MAC address {macAddress}...", macAddress);
                             BindMacOnConnection(connection, macAddress, durationHours);
-                            Console.WriteLine($"✅ Successfully bound MAC {macAddress} on {routerName}");
+                            _logger.LogInformation("   ✅ MAC address bound successfully");
                         }
                         catch (Exception macError)
                         {
-                            Console.WriteLine($"⚠️ MAC binding warning on {routerName} (non-critical): {macError.Message}");
+                            _logger.LogWarning("⚠️ MAC binding warning (non-critical): {message}", macError.Message);
                             // Don't fail activation if MAC binding fails
                         }
                     }
 
+                    _logger.LogInformation("🚀 ActivateOnAvailableRouter SUCCESS on {routerName}", routerName);
                     return successfulRouter;
                 }
                 catch (Exception ex)
                 {
                     string errorMsg = $"{routerName} ({routerIP}): {ex.Message}";
                     errors.Add(errorMsg);
-                    Console.WriteLine($"❌ Failed on {routerName}: {ex.Message}");
+                    _logger.LogError(ex, "❌ [{routerName}] Activation failed: {message}", routerName, ex.Message);
                     // Continue to next router
                 }
             }
 
             // If we get here, all routers failed
+            string allErrors = string.Join("; ", errors);
+            _logger.LogError("❌ Failed to activate {username} on any available router. Errors: {errors}", username, allErrors);
             throw new Exception(
                 $"Failed to activate {username} on any available router. Errors:\n" +
                 string.Join("\n", errors)
@@ -659,6 +697,8 @@ namespace MikrotikService.Services
         }
         public string BindMacOnAvailableRouter(string macAddress, int durationHours = 0)
         {
+            _logger.LogInformation("📌 BindMacOnAvailableRouter START: mac={macAddress}, duration={durationHours}h", macAddress, durationHours);
+            
             if (string.IsNullOrWhiteSpace(macAddress))
                 throw new ArgumentException("MAC address is required");
 
@@ -672,26 +712,30 @@ namespace MikrotikService.Services
 
                 try
                 {
-                    Console.WriteLine($"🔄 Attempting to bind MAC {macAddress} on {routerName} ({routerIP})...");
+                    _logger.LogInformation("🔄 [{routerName}] Attempting to bind MAC {macAddress}...", routerName, macAddress);
                     
                     using var connection = ConnectToRouter(routerIP);
+                    _logger.LogInformation("✅ [{routerName}] Connected successfully", routerName);
                     
                     // Try to bind the MAC
                     BindMacOnConnection(connection, macAddress, durationHours);
                     
-                    Console.WriteLine($"✅ Successfully bound MAC on {routerName}");
+                    _logger.LogInformation("✅ [{routerName}] Successfully bound MAC {macAddress}", routerName, macAddress);
+                    _logger.LogInformation("📌 BindMacOnAvailableRouter SUCCESS on {routerName}", routerName);
                     return routerName;
                 }
                 catch (Exception ex)
                 {
                     string errorMsg = $"{routerName} ({routerIP}): {ex.Message}";
                     errors.Add(errorMsg);
-                    Console.WriteLine($"❌ Failed on {routerName}: {ex.Message}");
+                    _logger.LogError(ex, "❌ [{routerName}] MAC binding failed: {message}", routerName, ex.Message);
                     // Continue to next router
                 }
             }
 
             // If we get here, all routers failed
+            string allErrors = string.Join("; ", errors);
+            _logger.LogError("❌ Failed to bind MAC {macAddress} on any available router. Errors: {errors}", macAddress, allErrors);
             throw new Exception(
                 $"Failed to bind MAC {macAddress} on any available router. Errors:\n" +
                 string.Join("\n", errors)
@@ -718,12 +762,16 @@ namespace MikrotikService.Services
 
                 try
                 {
+                    Console.WriteLine($"🔄 [{routerName}] Searching for MAC binding...");
                     using var connection = ConnectToRouter(routerIP);
                     
                     // Try to find and remove the binding
-                    var bindings = connection.LoadList<HotspotIpBinding>(
+                    // Use dynamic since HotspotIpBinding type may not be properly decorated in tik4net
+                    var bindings = connection.LoadList<dynamic>(
                         connection.CreateParameter("mac-address", macAddress)
                     ).ToList();
+
+                    Console.WriteLine($"   Found {bindings.Count} binding(s) for MAC {macAddress}");
 
                     if (bindings != null && bindings.Count > 0)
                     {
@@ -732,24 +780,26 @@ namespace MikrotikService.Services
 
                         try
                         {
+                            Console.WriteLine($"   Executing REMOVE command for binding (ID: {bindings[0].Id})");
                             removeCommand.ExecuteNonQuery();
-                            Console.WriteLine($"✅ Removed MAC binding from {routerName}");
+                            Console.WriteLine($"   ✅ Removed MAC binding from {routerName}");
                             foundOnAnyRouter = true;
                         }
                         catch (Exception ex)
                         {
                             if (!IsEmptyResponseException(ex))
                                 throw;
+                            Console.WriteLine("   Binding removed with empty response");
                         }
                     }
                     else
                     {
-                        Console.WriteLine($"ℹ️ MAC not found on {routerName}");
+                        Console.WriteLine($"   ℹ️ MAC not found on {routerName}");
                     }
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"⚠️ Could not check {routerName}: {ex.Message}");
+                    Console.WriteLine($"⚠️ [{routerName}] Could not check: {ex.Message}");
                     // Continue checking other routers
                 }
             }
@@ -765,15 +815,20 @@ namespace MikrotikService.Services
         /// </summary>
         private void ActivateUserOnConnection(ITikConnection connection, string username, int durationHours)
         {
+            _logger.LogInformation("   📋 ActivateUserOnConnection: user={username}, duration={durationHours}h", username, durationHours);
+            
             List<HotspotUser> users;
             try
             {
+                _logger.LogInformation("   🔍 Looking up existing hotspot user: {username}", username);
                 users = connection.LoadList<HotspotUser>(connection.CreateParameter("name", username)).ToList();
+                _logger.LogInformation("   ✅ User lookup complete: found {count} existing user(s)", users.Count);
             }
             catch (Exception ex)
             {
                 if (IsEmptyResponseException(ex))
                 {
+                    _logger.LogInformation("   ℹ️ Empty response during user lookup (expected in some cases)");
                     users = new List<HotspotUser>();
                 }
                 else
@@ -781,6 +836,7 @@ namespace MikrotikService.Services
             }
 
             var profile = $"profile-{durationHours}h";
+            _logger.LogInformation("   ⏱️ Using profile: {profile}", profile);
             
             // Ensure the requested profile exists 
             EnsureProfileExistsOnConnection(connection, profile);
@@ -789,6 +845,7 @@ namespace MikrotikService.Services
             if (users.Count > 0)
             {
                 var user = users.First();
+                _logger.LogInformation("   ✏️ Updating existing user (ID: {userId})", user.Id);
 
                 var setCommand = connection.CreateCommand("/ip/hotspot/user/set");
                 setCommand.AddParameter(".id", user.Id);
@@ -798,16 +855,21 @@ namespace MikrotikService.Services
 
                 try
                 {
+                    _logger.LogInformation("   ⚙️ Executing SET command for user {username}", username);
                     setCommand.ExecuteNonQuery();
+                    _logger.LogInformation("   ✅ User updated successfully");
                 }
                 catch (Exception ex)
                 {
                     if (!IsEmptyResponseException(ex))
                         throw;
+                    _logger.LogInformation("   ℹ️ SET command returned empty response (expected)");
                 }
             }
             else
             {
+                _logger.LogInformation("   ➕ Creating new hotspot user: {username}", username);
+                
                 var addCommand = connection.CreateCommand("/ip/hotspot/user/add");
                 addCommand.AddParameter("name", username);
                 addCommand.AddParameter("password", username);
@@ -816,70 +878,78 @@ namespace MikrotikService.Services
 
                 try
                 {
+                    _logger.LogInformation("   ⚙️ Executing ADD command for user {username}", username);
                     addCommand.ExecuteNonQuery();
+                    _logger.LogInformation("   ✅ User created successfully");
                 }
                 catch (Exception ex)
                 {
                     if (!IsEmptyResponseException(ex))
                         throw;
+                    _logger.LogInformation("   ℹ️ ADD command returned empty response (expected)");
                 }
             }
 
             // Verification
+            _logger.LogInformation("   🔍 Verifying user exists...");
             try
             {
                 var verified = connection.LoadList<HotspotUser>(connection.CreateParameter("name", username)).FirstOrDefault();
                 if (verified == null)
                 {
+                    _logger.LogError("   ❌ Verification failed: user '{username}' not found after operation", username);
                     throw new InvalidOperationException($"Failed to verify activation: user '{username}' not found after operation");
                 }
+                _logger.LogInformation("   ✅ User verified successfully");
             }
             catch (Exception ex)
             {
                 if (IsEmptyResponseException(ex))
                 {
+                    _logger.LogWarning("   ⚠️ Activation inconclusive: device returned '!empty' during verification");
                     throw new InvalidOperationException("Activation inconclusive: device returned '!empty' during verification.");
                 }
                 throw;
             }
         }
 
-        /// <summary>
-        /// Helper method: Bind MAC on a given connection
-        /// </summary>
         private void BindMacOnConnection(ITikConnection connection, string macAddress, int durationHours)
         {
+            Console.WriteLine($"   📌 BindMacOnConnection: mac={macAddress}, duration={durationHours}h");
+            
             try
             {
-                Console.WriteLine($"📌 Attempting to bind MAC: {macAddress}");
-                
                 // Check if binding already exists
-                var existingBindings = connection.LoadList<HotspotIpBinding>(
+                Console.WriteLine("   🔍 Checking for existing MAC bindings...");
+                // Use dynamic since HotspotIpBinding type may not be properly decorated in tik4net
+                var existingBindings = connection.LoadList<dynamic>(
                     connection.CreateParameter("mac-address", macAddress)
                 ).ToList();
 
-                Console.WriteLine($"   Checking for existing bindings: Found {existingBindings.Count}");
+                Console.WriteLine($"   ✅ MAC binding check complete: found {existingBindings.Count} existing binding(s)");
 
                 // Remove old binding if exists
                 if (existingBindings != null && existingBindings.Count > 0)
                 {
-                    Console.WriteLine($"   Removing old binding...");
+                    Console.WriteLine($"   🗑️ Removing old binding (ID: {existingBindings[0].Id})...");
                     var bindingCommand = connection.CreateCommand("/ip/hotspot/ip-binding/remove");
                     bindingCommand.AddParameter(".id", existingBindings[0].Id);
                     try
                     {
+                        Console.WriteLine("   ⚙️ Executing REMOVE command for old binding");
                         bindingCommand.ExecuteNonQuery();
-                        Console.WriteLine($"   ✅ Old binding removed");
+                        Console.WriteLine("   ✅ Old binding removed successfully");
                     }
                     catch (Exception ex)
                     {
                         if (!IsEmptyResponseException(ex))
                             throw;
+                        Console.WriteLine("   ℹ️ Old binding removed with empty response");
                     }
                 }
 
                 // Add new binding with bypass type
-                Console.WriteLine($"   Creating new binding with type=bypassed, timeout={durationHours}h");
+                Console.WriteLine($"   ➕ Creating new binding: type=bypassed, timeout={durationHours}h");
                 var addCommand = connection.CreateCommand("/ip/hotspot/ip-binding/add");
                 addCommand.AddParameter("mac-address", macAddress);
                 addCommand.AddParameter("type", "bypassed");
@@ -890,19 +960,20 @@ namespace MikrotikService.Services
 
                 try
                 {
+                    Console.WriteLine("   ⚙️ Executing ADD command for new binding");
                     addCommand.ExecuteNonQuery();
-                    Console.WriteLine($"   ✅ New binding created successfully");
+                    Console.WriteLine("   ✅ New binding created successfully");
                 }
                 catch (Exception ex)
                 {
                     if (!IsEmptyResponseException(ex))
                         throw;
-                    Console.WriteLine($"   ✅ Binding applied (with empty response)");
+                    Console.WriteLine("   ℹ️ New binding created with empty response");
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"❌ MAC binding failed: {ex.Message}");
+                Console.WriteLine($"   ❌ MAC binding failed: {ex.Message}");
                 throw new InvalidOperationException($"Failed to bind MAC address {macAddress} to bypass: {ex.Message}", ex);
             }
         }
