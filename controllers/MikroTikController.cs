@@ -359,6 +359,39 @@ namespace MikrotikService.Controllers
                 return StatusCode(500, new { message = "Error during unbind process", error = ex.Message });
             }
         }
+
+        /// <summary>
+        /// SILENT LOGIN ENDPOINT: Forces an active login session for automatic authentication
+        /// This moves the user from 'Hosts' to 'Active' on the MikroTik hotspot
+        /// Used for automatic authentication after payment or web login
+        /// </summary>
+        [HttpPost("silent-login")]
+        public IActionResult SilentLogin([FromBody] SilentLoginDto dto)
+        {
+            if (string.IsNullOrWhiteSpace(dto.Username) || string.IsNullOrWhiteSpace(dto.Password) ||
+                string.IsNullOrWhiteSpace(dto.MacAddress) || string.IsNullOrWhiteSpace(dto.IpAddress))
+            {
+                return BadRequest(new { message = "Username, password, MAC address, and IP address are required" });
+            }
+
+            try
+            {
+                string activeRouter = _service.SilentLogin(dto.Username, dto.Password, dto.MacAddress, dto.IpAddress, dto.DurationHours);
+                return Ok(new { 
+                    message = $"Silent login successful for {dto.Username}",
+                    activeRouter = activeRouter,
+                    note = "User is now actively connected to the hotspot"
+                });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(503, new { 
+                    message = "Silent login failed on all MikroTik routers", 
+                    error = ex.Message,
+                    hint = "Check if both Home (10.0.0.2) and School (10.0.0.3) routers are offline or VPN disconnected"
+                });
+            }
+        }
     }
 
     public class ActivateDto
@@ -395,6 +428,15 @@ namespace MikrotikService.Controllers
     public class CreateHotspotUserDto
     {
         public string? Username { get; set; }
+        public int DurationHours { get; set; }
+    }
+
+    public class SilentLoginDto
+    {
+        public string? Username { get; set; }
+        public string? Password { get; set; }
+        public string? MacAddress { get; set; }
+        public string? IpAddress { get; set; }
         public int DurationHours { get; set; }
     }
 }
