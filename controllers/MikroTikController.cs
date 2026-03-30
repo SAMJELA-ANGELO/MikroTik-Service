@@ -345,8 +345,13 @@ namespace MikrotikService.Controllers
 
             try
             {
+                // FIX: Decode the MAC address - it may arrive URL-encoded (02%3A38... instead of 02:38...)
+                string decodedMac = System.Net.WebUtility.UrlDecode(dto.MacAddress);
+                _logger.LogInformation("🔍 [BindMacFailover] Raw MAC: {rawMac} → Decoded MAC: {decodedMac}", 
+                    dto.MacAddress, decodedMac);
+                
                 _logger.LogInformation("📌 [BindMacFailover] Calling service.BindMacOnAvailableRouter...");
-                string activeRouter = _service.BindMacOnAvailableRouter(dto.MacAddress, dto.DurationHours ?? 0);
+                string activeRouter = _service.BindMacOnAvailableRouter(decodedMac, dto.DurationHours ?? 0);
                 _logger.LogInformation("✅ [BindMacFailover] Success on router: {router}", activeRouter);
                 
                 return Ok(new { 
@@ -378,11 +383,18 @@ namespace MikrotikService.Controllers
 
             try
             {
-                _service.UnbindMacOnAvailableRouters(macAddress);
-                return Ok(new { message = $"MAC address {macAddress} search and remove completed on all routers" });
+                // FIX: Decode the MAC address - it may arrive URL-encoded (02%3A38... instead of 02:38...)
+                string decodedMac = System.Net.WebUtility.UrlDecode(macAddress);
+                _logger.LogInformation("🔍 [UnbindMacFailover] Raw MAC: {rawMac} → Decoded MAC: {decodedMac}", 
+                    macAddress, decodedMac);
+                
+                _service.UnbindMacOnAvailableRouters(decodedMac);
+                _logger.LogInformation("✅ [UnbindMacFailover] Unbind completed for MAC: {decodedMac}", decodedMac);
+                return Ok(new { message = $"MAC address {decodedMac} search and remove completed on all routers" });
             }
             catch (Exception ex)
             {
+                _logger.LogError(ex, "❌ [UnbindMacFailover] Error: {message}", ex.Message);
                 return StatusCode(500, new { message = "Error during unbind process", error = ex.Message });
             }
         }
@@ -407,8 +419,13 @@ namespace MikrotikService.Controllers
 
             try
             {
+                // FIX: Decode the MAC address - it may arrive URL-encoded (02%3A38... instead of 02:38...)
+                string decodedMac = System.Net.WebUtility.UrlDecode(dto.MacAddress);
+                _logger.LogInformation("🔍 [SilentLogin] Raw MAC: {rawMac} → Decoded MAC: {decodedMac}", 
+                    dto.MacAddress, decodedMac);
+                
                 _logger.LogInformation("🔐 [SilentLogin] Calling service.SilentLogin...");
-                string activeRouter = _service.SilentLogin(dto.Username, dto.Password, dto.MacAddress, dto.IpAddress, dto.DurationHours);
+                string activeRouter = _service.SilentLogin(dto.Username, dto.Password, decodedMac, dto.IpAddress, dto.DurationHours);
                 _logger.LogInformation("✅ [SilentLogin] Success on router: {router}", activeRouter);
                 
                 return Ok(new { 
