@@ -14,8 +14,8 @@ namespace MikrotikService.Services
         private readonly string pass = "To2day";
         
         // Multi-router support (for failover)
-        private readonly string[] routerIPs = new[] { "10.0.0.2", "10.0.0.3" }; // Home: 10.0.0.2, School: 10.0.0.3
-        private readonly string[] routerNames = new[] { "Home", "School" }; // Router names for logging
+        private readonly string[] routerIPs = new[] { "10.0.0.2", "10.0.0.3", "192.168.1.154" }; // Home: 10.0.0.2, School: 10.0.0.3, Local: 192.168.1.154
+        private readonly string[] routerNames = new[] { "Home", "School", "Local" }; // Router names for logging
 
         private ITikConnection Connect()
         {
@@ -71,7 +71,7 @@ namespace MikrotikService.Services
             var profile = $"profile-{durationHours}h";
             
             // Ensure the requested profile exists on the device before assigning it.
-            EnsureProfileExists(connection, profile);
+            EnsureProfileExistsOnConnection(connection, profile);
             // Execute set or add
             if (users.Count > 0)
             {
@@ -133,31 +133,81 @@ namespace MikrotikService.Services
             }
         }
 
-        private void EnsureProfileExists(ITikConnection connection, string profileName)
+
+        private bool IsHotspotHostEntryPresent(ITikConnection connection, string macAddress, string ip)
         {
             if (connection == null)
                 throw new ArgumentNullException(nameof(connection));
-            if (string.IsNullOrWhiteSpace(profileName))
-                return;
+
+            if (string.IsNullOrWhiteSpace(macAddress) || string.IsNullOrWhiteSpace(ip))
+                return false;
 
             try
             {
-                var addProfile = connection.CreateCommand("/ip/hotspot/user/profile/add");
-                addProfile.AddParameter("name", profileName);
-                addProfile.ExecuteNonQuery();
+                // Use dynamic since HotspotHost type may not be available in tik4net
+                var hosts = connection.LoadList<dynamic>(
+                    connection.CreateParameter("mac-address", macAddress),
+                    connection.CreateParameter("address", ip)
+                ).ToList();
+
+                var found = hosts.Any();
+                Console.WriteLine($"🔍 Hotspot host lookup: mac={macAddress}, ip={ip}, found={found}");
+                return found;
             }
             catch (Exception ex)
             {
-                if (IsEmptyResponseException(ex))
-                    return;
-
-                var msg = ex.Message ?? string.Empty;
-                // Treat common 'already exists' messages as non-fatal — profile is present.
-                if (msg.Contains("already") || msg.Contains("exists") || msg.Contains("duplicate"))
-                    return;
-
-                throw;
+                Console.WriteLine($"⚠️ Hotspot host lookup failed: {ex.Message}");
+                return false;
             }
+        }
+
+        private void MoveHostToActive(ITikConnection connection, string username, string password, string macAddress, string ip)
+        {
+            if (connection == null)
+                throw new ArgumentNullException(nameof(connection));
+
+            if (string.IsNullOrWhiteSpace(username) ||
+                string.IsNullOrWhiteSpace(password) ||
+                string.IsNullOrWhiteSpace(macAddress) ||
+                string.IsNullOrWhiteSpace(ip))
+            {
+                throw new ArgumentException("Username, password, MAC address, and IP are required for forced login.");
+            }
+
+            // Verify that the host entry exists in the hotspot host list (by MAC and IP)
+            if (!IsHotspotHostEntryPresent(connection, macAddress, ip))
+            {
+                throw new InvalidOperationException($"Host entry not found for MAC {macAddress} and IP {ip}. Ensure device appears in /ip/hotspot/host first.");
+            }
+
+            var loginCmd = connection.CreateCommand("/ip/hotspot/active/login");
+            loginCmd.AddParameter("user", username);
+            loginCmd.AddParameter("password", password);
+            loginCmd.AddParameter("mac-address", macAddress);
+            loginCmd.AddParameter("ip", ip);
+
+            Console.WriteLine($"📡 Force login (Active) command: user={username}, mac={macAddress}, ip={ip}");
+
+            try
+            {
+                loginCmd.ExecuteNonQuery();
+                Console.WriteLine("✅ User is now Active (forced login)");
+            }
+            catch (Exception ex)
+            {
+                if (!IsEmptyResponseException(ex))
+                {
+                    Console.WriteLine($"❌ Forced login failed: {ex.Message}");
+                    throw;
+                }
+                Console.WriteLine("✅ Forced login completed with empty response (tik4net !empty case)");
+            }
+        }
+
+        public void MoveHostToActive(string username, string password, string macAddress, string ip)
+        {
+            using var connection = Connect();
+            MoveHostToActive(connection, username, password, macAddress, ip);
         }
 
         public void DeactivateUser(string username)
@@ -545,6 +595,13 @@ namespace MikrotikService.Services
         /// </summary>
         public string SilentLogin(string username, string password, string mac, string ip, int durationHours)
         {
+            Console.WriteLine($"🔐 ===== SILENT LOGIN START =====");
+            Console.WriteLine($"🔐 Username: {username}");
+            Console.WriteLine($"🔐 Password: [HIDDEN]");
+            Console.WriteLine($"🔐 MAC: {mac}");
+            Console.WriteLine($"🔐 IP: {ip}");
+            Console.WriteLine($"🔐 Duration Hours: {durationHours}");
+
             if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(password) ||
                 string.IsNullOrWhiteSpace(mac) || string.IsNullOrWhiteSpace(ip))
                 throw new ArgumentException("Username, password, MAC address, and IP are required");
@@ -558,12 +615,13 @@ namespace MikrotikService.Services
                 string routerIP = routerIPs[i];
                 string routerName = routerNames.Length > i ? routerNames[i] : $"Router-{i}";
 
+                Console.WriteLine($"🔄 Attempting silent login on {routerName} ({routerIP})...");
+
                 try
                 {
-                    Console.WriteLine($"🔐 Attempting silent login for {username} on {routerName} ({routerIP})...");
-                    
                     using var connection = ConnectToRouter(routerIP);
-                    
+                    Console.WriteLine($"✅ Connected to {routerName}");
+
                     // 1. Create/Update the Hotspot User first (so they exist in the DB)
                     Console.WriteLine($"   1️⃣ Creating/updating hotspot user...");
                     ActivateUserOnConnection(connection, username, durationHours);
@@ -572,27 +630,13 @@ namespace MikrotikService.Services
                     // 2. FORCE the login session for this specific device
                     // This makes the MikroTik move the user from 'Hosts' to 'Active'
                     Console.WriteLine($"   2️⃣ Forcing login session (user: {username}, mac: {mac}, ip: {ip})...");
-                    var loginCmd = connection.CreateCommand("/ip/hotspot/active/login");
-                    loginCmd.AddParameter("user", username);
-                    loginCmd.AddParameter("password", password);
-                    loginCmd.AddParameter("mac-address", mac);
-                    loginCmd.AddParameter("ip", ip); // The user's current local IP
-                    
-                    try
-                    {
-                        loginCmd.ExecuteNonQuery();
-                        Console.WriteLine($"   ✅ Login session forced successfully");
-                    }
-                    catch (Exception ex)
-                    {
-                        if (!IsEmptyResponseException(ex))
-                            throw;
-                        Console.WriteLine($"   ✅ Login command executed (with empty response)");
-                    }
+                    MoveHostToActive(username, password, mac, ip);
+                    Console.WriteLine($"   ✅ Login session forced successfully by MoveHostToActive");
 
                     // If we get here, login was successful
                     successfulRouter = routerName;
                     Console.WriteLine($"✅ Silent login successful for {username} on {routerName}");
+                    Console.WriteLine($"🔐 ===== SILENT LOGIN SUCCESS =====");
                     return successfulRouter;
                 }
                 catch (Exception ex)
@@ -600,11 +644,14 @@ namespace MikrotikService.Services
                     string errorMsg = $"{routerName} ({routerIP}): {ex.Message}";
                     errors.Add(errorMsg);
                     Console.WriteLine($"❌ Silent login failed on {routerName}: {ex.Message}");
+                    Console.WriteLine($"❌ Error details: {ex.ToString()}");
                     // Continue to next router
                 }
             }
 
             // If we get here, all routers failed
+            Console.WriteLine($"❌ ===== SILENT LOGIN FAILED - ALL ROUTERS FAILED =====");
+            Console.WriteLine($"❌ Errors: {string.Join("; ", errors)}");
             throw new Exception(
                 $"Failed to perform silent login for {username} on any available router. Errors:\n" +
                 string.Join("\n", errors)
@@ -674,7 +721,7 @@ namespace MikrotikService.Services
                     using var connection = ConnectToRouter(routerIP);
                     
                     // Try to find and remove the binding
-                    var bindings = connection.LoadList<dynamic>(
+                    var bindings = connection.LoadList<HotspotIpBinding>(
                         connection.CreateParameter("mac-address", macAddress)
                     ).ToList();
 
@@ -807,7 +854,7 @@ namespace MikrotikService.Services
                 Console.WriteLine($"📌 Attempting to bind MAC: {macAddress}");
                 
                 // Check if binding already exists
-                var existingBindings = connection.LoadList<dynamic>(
+                var existingBindings = connection.LoadList<HotspotIpBinding>(
                     connection.CreateParameter("mac-address", macAddress)
                 ).ToList();
 
