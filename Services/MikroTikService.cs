@@ -735,19 +735,26 @@ namespace MikrotikService.Services
         {
             try
             {
+                Console.WriteLine($"📌 Attempting to bind MAC: {macAddress}");
+                
                 // Check if binding already exists
                 var existingBindings = connection.LoadList<dynamic>(
+                    "/ip/hotspot/ip-binding",
                     connection.CreateParameter("mac-address", macAddress)
                 ).ToList();
+
+                Console.WriteLine($"   Checking for existing bindings: Found {existingBindings.Count}");
 
                 // Remove old binding if exists
                 if (existingBindings != null && existingBindings.Count > 0)
                 {
+                    Console.WriteLine($"   Removing old binding...");
                     var bindingCommand = connection.CreateCommand("/ip/hotspot/ip-binding/remove");
                     bindingCommand.AddParameter(".id", existingBindings[0].Id);
                     try
                     {
                         bindingCommand.ExecuteNonQuery();
+                        Console.WriteLine($"   ✅ Old binding removed");
                     }
                     catch (Exception ex)
                     {
@@ -757,6 +764,7 @@ namespace MikrotikService.Services
                 }
 
                 // Add new binding with bypass type
+                Console.WriteLine($"   Creating new binding with type=bypassed, timeout={durationHours}h");
                 var addCommand = connection.CreateCommand("/ip/hotspot/ip-binding/add");
                 addCommand.AddParameter("mac-address", macAddress);
                 addCommand.AddParameter("type", "bypassed");
@@ -768,15 +776,18 @@ namespace MikrotikService.Services
                 try
                 {
                     addCommand.ExecuteNonQuery();
+                    Console.WriteLine($"   ✅ New binding created successfully");
                 }
                 catch (Exception ex)
                 {
                     if (!IsEmptyResponseException(ex))
                         throw;
+                    Console.WriteLine($"   ✅ Binding applied (with empty response)");
                 }
             }
             catch (Exception ex)
             {
+                Console.WriteLine($"❌ MAC binding failed: {ex.Message}");
                 throw new InvalidOperationException($"Failed to bind MAC address {macAddress} to bypass: {ex.Message}", ex);
             }
         }
