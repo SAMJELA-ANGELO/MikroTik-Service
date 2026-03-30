@@ -765,22 +765,24 @@ namespace MikrotikService.Services
                     Console.WriteLine($"🔄 [{routerName}] Searching for MAC binding...");
                     using var connection = ConnectToRouter(routerIP);
                     
-                    // Try to find and remove the binding
-                    // Use dynamic since HotspotIpBinding type may not be properly decorated in tik4net
-                    var bindings = connection.LoadList<dynamic>(
-                        connection.CreateParameter("mac-address", macAddress)
-                    ).ToList();
-
+                    // Try to find and remove the binding using raw command instead of LoadList
+                    // (LoadList fails due to HotspotIpBinding not having TikEntityAttribute)
+                    var printCmd = connection.CreateCommand("/ip/hotspot/ip-binding/print");
+                    printCmd.AddParameter(".proplist", ".id");
+                    printCmd.AddParameter("?mac-address", macAddress);
+                    
+                    var bindings = printCmd.ExecuteList().ToList();
                     Console.WriteLine($"   Found {bindings.Count} binding(s) for MAC {macAddress}");
 
                     if (bindings != null && bindings.Count > 0)
                     {
+                        var bindingId = bindings[0].GetResponseField(".id");
                         var removeCommand = connection.CreateCommand("/ip/hotspot/ip-binding/remove");
-                        removeCommand.AddParameter(".id", bindings[0].Id);
+                        removeCommand.AddParameter(".id", bindingId);
 
                         try
                         {
-                            Console.WriteLine($"   Executing REMOVE command for binding (ID: {bindings[0].Id})");
+                            Console.WriteLine($"   Executing REMOVE command for binding (ID: {bindingId})");
                             removeCommand.ExecuteNonQuery();
                             Console.WriteLine($"   ✅ Removed MAC binding from {routerName}");
                             foundOnAnyRouter = true;
@@ -919,25 +921,26 @@ namespace MikrotikService.Services
             
             try
             {
-                // Check if binding already exists
+                // Check if binding already exists using raw command
                 Console.WriteLine("   🔍 Checking for existing MAC bindings...");
-                // Use dynamic since HotspotIpBinding type may not be properly decorated in tik4net
-                var existingBindings = connection.LoadList<dynamic>(
-                    connection.CreateParameter("mac-address", macAddress)
-                ).ToList();
-
-                Console.WriteLine($"   ✅ MAC binding check complete: found {existingBindings.Count} existing binding(s)");
+                var printCmd = connection.CreateCommand("/ip/hotspot/ip-binding/print");
+                printCmd.AddParameter(".proplist", ".id");
+                printCmd.AddParameter("?mac-address", macAddress);
+                
+                var results = printCmd.ExecuteList().ToList();
+                Console.WriteLine($"   ✅ MAC binding check complete: found {results.Count} existing binding(s)");
 
                 // Remove old binding if exists
-                if (existingBindings != null && existingBindings.Count > 0)
+                if (results.Count > 0)
                 {
-                    Console.WriteLine($"   🗑️ Removing old binding (ID: {existingBindings[0].Id})...");
-                    var bindingCommand = connection.CreateCommand("/ip/hotspot/ip-binding/remove");
-                    bindingCommand.AddParameter(".id", existingBindings[0].Id);
+                    var bindingId = results[0].GetResponseField(".id");
+                    Console.WriteLine($"   🗑️ Removing old binding (ID: {bindingId})...");
+                    var removeCommand = connection.CreateCommand("/ip/hotspot/ip-binding/remove");
+                    removeCommand.AddParameter(".id", bindingId);
                     try
                     {
                         Console.WriteLine("   ⚙️ Executing REMOVE command for old binding");
-                        bindingCommand.ExecuteNonQuery();
+                        removeCommand.ExecuteNonQuery();
                         Console.WriteLine("   ✅ Old binding removed successfully");
                     }
                     catch (Exception ex)
