@@ -268,14 +268,22 @@ namespace MikrotikService.Controllers
 
             try
             {
+                // FIX: Decode the MAC address if provided - it may arrive URL-encoded (02%3A38... instead of 02:38...)
+                string decodedMac = null;
+                if (!string.IsNullOrWhiteSpace(dto.MacAddress)) {
+                    decodedMac = System.Net.WebUtility.UrlDecode(dto.MacAddress);
+                    _logger.LogInformation("🔍 [ActivateFailover] Raw MAC: {rawMac} → Decoded MAC: {decodedMac}", 
+                        dto.MacAddress, decodedMac);
+                }
+                
                 _logger.LogInformation("🚀 [ActivateFailover] Calling service.ActivateOnAvailableRouter...");
-                string useRouter = _service.ActivateOnAvailableRouter(dto.Username, dto.DurationHours, dto.MacAddress);
+                string useRouter = _service.ActivateOnAvailableRouter(dto.Username, dto.DurationHours, decodedMac);
                 _logger.LogInformation("✅ [ActivateFailover] Success on router: {router}", useRouter);
                 
                 return Ok(new { 
                     message = $"User {dto.Username} activated for {dto.DurationHours} hours",
                     activeRouter = useRouter,
-                    macBound = !string.IsNullOrWhiteSpace(dto.MacAddress)
+                    macBound = !string.IsNullOrWhiteSpace(decodedMac)
                 });
             }
             catch (Exception ex)
