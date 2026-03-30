@@ -771,8 +771,17 @@ namespace MikrotikService.Services
                     printCmd.AddParameter(".proplist", ".id");
                     printCmd.AddParameter("?mac-address", macAddress);
                     
-                    var bindings = printCmd.ExecuteList().ToList();
-                    Console.WriteLine($"   Found {bindings.Count} binding(s) for MAC {macAddress}");
+                    List<ITikReSentence> bindings = new List<ITikReSentence>();
+                    try
+                    {
+                        bindings = printCmd.ExecuteList().ToList();
+                        Console.WriteLine($"   Found {bindings.Count} binding(s) for MAC {macAddress}");
+                    }
+                    catch (Exception ex) when (IsEmptyResponseException(ex))
+                    {
+                        Console.WriteLine($"   ℹ️ No bindings found for MAC {macAddress} (empty response)");
+                        bindings = new List<ITikReSentence>();
+                    }
 
                     if (bindings != null && bindings.Count > 0)
                     {
@@ -927,8 +936,17 @@ namespace MikrotikService.Services
                 printCmd.AddParameter(".proplist", ".id");
                 printCmd.AddParameter("?mac-address", macAddress);
                 
-                var results = printCmd.ExecuteList().ToList();
-                Console.WriteLine($"   ✅ MAC binding check complete: found {results.Count} existing binding(s)");
+                List<ITikReSentence> results = new List<ITikReSentence>();
+                try
+                {
+                    results = printCmd.ExecuteList().ToList();
+                    Console.WriteLine($"   ✅ MAC binding check complete: found {results.Count} existing binding(s)");
+                }
+                catch (Exception ex) when (IsEmptyResponseException(ex))
+                {
+                    Console.WriteLine("   ℹ️ No existing bindings found (empty response) - will create new one");
+                    results = new List<ITikReSentence>();
+                }
 
                 // Remove old binding if exists
                 if (results.Count > 0)
