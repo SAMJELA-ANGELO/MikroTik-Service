@@ -1,0 +1,13 @@
+C:\Users\Splendidpips\OneDrive\Documents\starlink\MikrotikService\publish\MikrotikService.exe
+C:\Users\Splendidpips\OneDrive\Documents\starlink\MikrotikService\publish\appsettings.Development.json
+C:\Users\Splendidpips\OneDrive\Documents\starlink\MikrotikService\publish\appsettings.json
+C:\Users\Splendidpips\OneDrive\Documents\starlink\MikrotikService\publish\MikrotikService.dll
+C:\Users\Splendidpips\OneDrive\Documents\starlink\MikrotikService\publish\MikrotikService.deps.json
+C:\Users\Splendidpips\OneDrive\Documents\starlink\MikrotikService\publish\MikrotikService.runtimeconfig.json
+C:\Users\Splendidpips\OneDrive\Documents\starlink\MikrotikService\publish\MikrotikService.pdb
+C:\Users\Splendidpips\OneDrive\Documents\starlink\MikrotikService\publish\Microsoft.OpenApi.dll
+C:\Users\Splendidpips\OneDrive\Documents\starlink\MikrotikService\publish\Swashbuckle.AspNetCore.Swagger.dll
+C:\Users\Splendidpips\OneDrive\Documents\starlink\MikrotikService\publish\Swashbuckle.AspNetCore.SwaggerGen.dll
+C:\Users\Splendidpips\OneDrive\Documents\starlink\MikrotikService\publish\Swashbuckle.AspNetCore.SwaggerUI.dll
+C:\Users\Splendidpips\OneDrive\Documents\starlink\MikrotikService\publish\tik4net.dll
+C:\Users\Splendidpips\OneDrive\Documents\starlink\MikrotikService\publish\tik4net.objects.dll

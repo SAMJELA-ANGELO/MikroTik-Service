@@ -1,0 +1,11 @@
+{
+  "Version": 1,
+  "Hash": "YhBSjaIJVVD9HRfXyzgfZOxhVdRpakskOn3NimsqANo=",
+  "Source": "MikrotikService",
+  "BasePath": "_content/MikrotikService",
+  "Mode": "Default",
+  "ManifestType": "Publish",
+  "ReferencedProjectsConfiguration": [],
+  "DiscoveryPatterns": [],
+  "Assets": []
+}

@@ -1,0 +1,11 @@
+{
+  "Version": 1,
+  "Hash": "PGo1+P1Z+8BEQzZf6mymlzqL6Dkyj8O2NoBr0IiPA4A=",
+  "Source": "MikrotikService",
+  "BasePath": "_content/MikrotikService",
+  "Mode": "Default",
+  "ManifestType": "Build",
+  "ReferencedProjectsConfiguration": [],
+  "DiscoveryPatterns": [],
+  "Assets": []
+}
