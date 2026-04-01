@@ -118,46 +118,30 @@ namespace MikrotikService.Services
             
             // Ensure the requested profile exists on the device before assigning it.
             EnsureProfileExistsOnConnection(connection, profile);
-            // Execute set or add
-            if (users.Count > 0)
+            
+            if (users.Count == 0)
             {
-                var user = users.First();
-
-                var setCommand = connection.CreateCommand("/ip/hotspot/user/set");
-                setCommand.AddParameter(".id", user.Id);
-                setCommand.AddParameter("profile", profile);
-                setCommand.AddParameter("limit-uptime", $"{durationHours}h");
-                setCommand.AddParameter("disabled", "no");
-
-                try
-                {
-                    setCommand.ExecuteNonQuery();
-                }
-                catch (Exception ex)
-                {
-                    if (!IsEmptyResponseException(ex))
-                        throw;
-                    // else continue to verification
-                }
+                throw new InvalidOperationException($"User '{username}' not found. Create the user first before activating.");
             }
-            else
-            {
-                var addCommand = connection.CreateCommand("/ip/hotspot/user/add");
-                addCommand.AddParameter("name", username);
-                addCommand.AddParameter("password", username);
-                addCommand.AddParameter("profile", profile);
-                addCommand.AddParameter("limit-uptime", $"{durationHours}h");
 
-                try
-                {
-                    addCommand.ExecuteNonQuery();
-                }
-                catch (Exception ex)
-                {
-                    if (!IsEmptyResponseException(ex))
-                        throw;
-                    // else continue to verification
-                }
+            var user = users.First();
+
+            var setCommand = connection.CreateCommand("/ip/hotspot/user/set");
+            setCommand.AddParameter(".id", user.Id);
+            setCommand.AddParameter("profile", profile);
+            setCommand.AddParameter("limit-uptime", $"{durationHours}h");
+            setCommand.AddParameter("disabled", "no");
+
+            try
+            {
+                setCommand.ExecuteNonQuery();
+                _logger.LogInformation("✅ User {username} activated with {hours}h access", username, durationHours);
+            }
+            catch (Exception ex)
+            {
+                if (!IsEmptyResponseException(ex))
+                    throw;
+                // else continue to verification
             }
 
             // Verification: ensure the user now exists on the device
@@ -291,15 +275,21 @@ namespace MikrotikService.Services
             }
             using var connection = Connect();
 
+            // Ensure the blocked profile exists
+            EnsureProfileExistsOnConnection(connection, "profile-blocked");
+
             var addCommand = connection.CreateCommand("/ip/hotspot/user/add");
             addCommand.AddParameter("name", username);
             addCommand.AddParameter("password", password);
+            addCommand.AddParameter("profile", "profile-blocked");
+            addCommand.AddParameter("disabled", "no");
 
             // Try to add the user; if tik4net throws the known '!empty' response error,
             // continue to verification step instead of failing immediately.
             try
             {
                 addCommand.ExecuteNonQuery();
+                _logger.LogInformation("✅ User {username} created with blocked access", username);
             }
             catch (Exception ex)
             {
@@ -1008,9 +998,54 @@ namespace MikrotikService.Services
 
             try
             {
+                _logger.LogInformation("   🔍 Checking if profile exists: {profileName}", profileName);
+                
+                // Check if profile already exists
+                var printCmd = connection.CreateCommand("/ip/hotspot/user/profile/print");
+                printCmd.AddParameter("?name", profileName);
+                var existingProfiles = SafeExecuteList(printCmd).ToList();
+                
+                if (existingProfiles.Count > 0)
+                {
+                    _logger.LogInformation("   ✅ Profile already exists: {profileName}", profileName);
+                    return;
+                }
+
+                _logger.LogInformation("   ➕ Creating new profile: {profileName}", profileName);
+                
+                // Extract duration from profile name (e.g., "profile-2h" → 2 hours)
+                int sessionTimeoutSeconds = 0;
+                if (profileName.Contains("-"))
+                {
+                    var parts = profileName.Split('-');
+                    if (parts.Length > 1 && int.TryParse(parts[parts.Length - 1].Replace("h", ""), out int hours))
+                    {
+                        sessionTimeoutSeconds = hours * 3600; // Convert hours to seconds
+                        _logger.LogInformation("   ⏱️ Calculated session timeout: {hours}h ({seconds}s)", hours, sessionTimeoutSeconds);
+                    }
+                }
+
                 var addProfile = connection.CreateCommand("/ip/hotspot/user/profile/add");
                 addProfile.AddParameter("name", profileName);
+                
+                // Special handling for blocked profile
+                if (profileName == "profile-blocked")
+                {
+                    addProfile.AddParameter("rate-limit", "0/0"); // Block all traffic
+                    _logger.LogInformation("   🚫 Profile set to block all internet access");
+                }
+                else
+                {
+                    // Set session timeout on the profile for paid profiles
+                    if (sessionTimeoutSeconds > 0)
+                    {
+                        addProfile.AddParameter("session-timeout", $"{sessionTimeoutSeconds}s");
+                        _logger.LogInformation("   ⏱️ Profile session-timeout set to: {timeout}s", sessionTimeoutSeconds);
+                    }
+                }
+                
                 addProfile.ExecuteNonQuery();
+                _logger.LogInformation("   ✅ Profile created successfully");
             }
             catch (Exception ex)
             {
@@ -1021,6 +1056,7 @@ namespace MikrotikService.Services
                 if (msg.Contains("already") || msg.Contains("exists") || msg.Contains("duplicate"))
                     return;
 
+                _logger.LogError("   ❌ Error ensuring profile exists: {error}", ex.Message);
                 throw;
             }
         }

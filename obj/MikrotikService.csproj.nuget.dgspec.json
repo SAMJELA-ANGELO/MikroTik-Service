@@ -1,17 +1,17 @@
 {
   "format": 1,
   "restore": {
-    "C:\\Users\\Splendidpips\\OneDrive\\Documents\\starlink\\MikrotikService\\MikrotikService.csproj": {}
+    "C:\\Users\\Splendidpips\\OneDrive\\Documents\\Splendid Stalink\\MikroTik-Service\\MikrotikService.csproj": {}
   },
   "projects": {
-    "C:\\Users\\Splendidpips\\OneDrive\\Documents\\starlink\\MikrotikService\\MikrotikService.csproj": {
+    "C:\\Users\\Splendidpips\\OneDrive\\Documents\\Splendid Stalink\\MikroTik-Service\\MikrotikService.csproj": {
       "version": "1.0.0",
       "restore": {
-        "projectUniqueName": "C:\\Users\\Splendidpips\\OneDrive\\Documents\\starlink\\MikrotikService\\MikrotikService.csproj",
+        "projectUniqueName": "C:\\Users\\Splendidpips\\OneDrive\\Documents\\Splendid Stalink\\MikroTik-Service\\MikrotikService.csproj",
         "projectName": "MikrotikService",
-        "projectPath": "C:\\Users\\Splendidpips\\OneDrive\\Documents\\starlink\\MikrotikService\\MikrotikService.csproj",
+        "projectPath": "C:\\Users\\Splendidpips\\OneDrive\\Documents\\Splendid Stalink\\MikroTik-Service\\MikrotikService.csproj",
         "packagesPath": "C:\\Users\\Splendidpips\\.nuget\\packages\\",
-        "outputPath": "C:\\Users\\Splendidpips\\OneDrive\\Documents\\starlink\\MikrotikService\\obj\\",
+        "outputPath": "C:\\Users\\Splendidpips\\OneDrive\\Documents\\Splendid Stalink\\MikroTik-Service\\obj\\",
         "projectStyle": "PackageReference",
         "configFilePaths": [
           "C:\\Users\\Splendidpips\\AppData\\Roaming\\NuGet\\NuGet.Config"
