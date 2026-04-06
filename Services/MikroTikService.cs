@@ -926,6 +926,19 @@ namespace MikrotikService.Services
                     // Don't fail here - this is not critical, continue with the update
                 }
 
+                _logger.LogInformation("   ♻️ Resetting permanent counters for user {username}", username);
+                try
+                {
+                    var resetCmd = connection.CreateCommand("/ip/hotspot/user/reset-counters");
+                    resetCmd.AddParameter("numbers", username);
+                    resetCmd.ExecuteNonQuery();
+                    _logger.LogInformation("   ✅ Counters reset successfully for {username}", username);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning("   ⚠️ Could not reset counters for {username}: {message}", username, ex.Message);
+                }
+
                 var setCommand = connection.CreateCommand("/ip/hotspot/user/set");
                 setCommand.AddParameter(".id", user.Id);
                 setCommand.AddParameter("profile", profile);
