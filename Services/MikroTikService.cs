@@ -15,8 +15,8 @@ namespace MikrotikService.Services
         private readonly string pass = "To2day";
         
         // Multi-router support (for failover)
-        private readonly string[] routerIPs = new[] { "10.0.0.2", "10.0.0.3", "192.168.1.154" }; // Home: 10.0.0.2, School: 10.0.0.3, Local: 192.168.1.154
-        private readonly string[] routerNames = new[] { "Home", "School", "Local" }; // Router names for logging
+        private readonly string[] routerIPs = new[] { "10.0.0.3", "10.0.0.2" }; // Home: 10.0.0.2, School: 10.0.0.3
+        private readonly string[] routerNames = new[] { "School", "Home" }; // Router names for logging
         
         private readonly ILogger<MikrotikService> _logger;
 
