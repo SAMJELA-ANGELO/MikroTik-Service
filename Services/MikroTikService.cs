@@ -282,14 +282,14 @@ namespace MikrotikService.Services
             addCommand.AddParameter("name", username);
             addCommand.AddParameter("password", password);
             addCommand.AddParameter("profile", "profile-blocked");
-            addCommand.AddParameter("disabled", "no");
+            addCommand.AddParameter("disabled", "yes");
 
             // Try to add the user; if tik4net throws the known '!empty' response error,
             // continue to verification step instead of failing immediately.
             try
             {
                 addCommand.ExecuteNonQuery();
-                _logger.LogInformation("✅ User {username} created with blocked access", username);
+                _logger.LogInformation("✅ User {username} created with blocked access and disabled until activation", username);
             }
             catch (Exception ex)
             {
