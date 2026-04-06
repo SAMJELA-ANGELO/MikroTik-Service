@@ -822,6 +822,62 @@ namespace MikrotikService.Services
         /// <summary>
         /// Helper method: Activate user on a given connection
         /// </summary>
+        private void DisconnectActiveSessionForUser(ITikConnection connection, string username)
+        {
+            _logger.LogInformation("   🔌 DisconnectActiveSessionForUser: user={username}", username);
+            
+            try
+            {
+                // Query /ip/hotspot/active for this user's sessions
+                _logger.LogInformation("   🔍 Looking for active sessions for {username}...", username);
+                
+                var printCmd = connection.CreateCommand("/ip/hotspot/active/print");
+                var results = SafeExecuteList(printCmd).ToList();
+                
+                if (results.Count == 0)
+                {
+                    _logger.LogInformation("   ℹ️ No active sessions found for {username}", username);
+                    return;
+                }
+
+                // Look for sessions matching this username
+                bool foundSession = false;
+                foreach (var session in results)
+                {
+                    string sessionUsername = session.GetResponseField("user");
+                    if (sessionUsername == username)
+                    {
+                        string sessionId = session.GetResponseField(".id");
+                        _logger.LogInformation("   🗑️ Found active session ID {sessionId} for {username}, disconnecting...", sessionId, username);
+                        
+                        var removeCmd = connection.CreateCommand("/ip/hotspot/active/remove");
+                        removeCmd.AddParameter(".id", sessionId);
+                        removeCmd.ExecuteNonQuery();
+                        
+                        _logger.LogInformation("   ✅ Active session {sessionId} removed for {username}", sessionId, username);
+                        foundSession = true;
+                    }
+                }
+
+                if (!foundSession)
+                {
+                    _logger.LogInformation("   ℹ️ No active sessions found with username {username}", username);
+                }
+            }
+            catch (Exception ex)
+            {
+                if (IsEmptyResponseException(ex))
+                {
+                    _logger.LogInformation("   ℹ️ No active sessions to disconnect (expected for inactive users)");
+                }
+                else
+                {
+                    _logger.LogWarning("   ⚠️ Error disconnecting active session: {message}", ex.Message);
+                    throw;
+                }
+            }
+        }
+
         private void ActivateUserOnConnection(ITikConnection connection, string username, int durationHours)
         {
             _logger.LogInformation("   📋 ActivateUserOnConnection: user={username}, duration={durationHours}h", username, durationHours);
@@ -856,6 +912,20 @@ namespace MikrotikService.Services
                 var user = users.First();
                 _logger.LogInformation("   ✏️ Updating existing user (ID: {userId})", user.Id);
 
+                // IMPORTANT: Disconnect any active sessions for this user to reset the uptime counter
+                // This is critical for reactivations of the same plan
+                _logger.LogInformation("   🔌 Disconnecting any active sessions for user {username} to reset uptime counter", username);
+                try
+                {
+                    DisconnectActiveSessionForUser(connection, username);
+                    _logger.LogInformation("   ✅ Active sessions cleared for {username}", username);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning("   ⚠️ Warning disconnecting active session: {message}", ex.Message);
+                    // Don't fail here - this is not critical, continue with the update
+                }
+
                 var setCommand = connection.CreateCommand("/ip/hotspot/user/set");
                 setCommand.AddParameter(".id", user.Id);
                 setCommand.AddParameter("profile", profile);
@@ -866,7 +936,7 @@ namespace MikrotikService.Services
                 {
                     _logger.LogInformation("   ⚙️ Executing SET command for user {username}", username);
                     setCommand.ExecuteNonQuery();
-                    _logger.LogInformation("   ✅ User updated successfully");
+                    _logger.LogInformation("   ✅ User updated successfully with new duration {durationHours}h", durationHours);
                 }
                 catch (Exception ex)
                 {

@@ -269,7 +269,7 @@ namespace MikrotikService.Controllers
             try
             {
                 // FIX: Decode the MAC address if provided - it may arrive URL-encoded (02%3A38... instead of 02:38...)
-                string decodedMac = null;
+                string? decodedMac = null;
                 if (!string.IsNullOrWhiteSpace(dto.MacAddress)) {
                     decodedMac = System.Net.WebUtility.UrlDecode(dto.MacAddress);
                     _logger.LogInformation("🔍 [ActivateFailover] Raw MAC: {rawMac} → Decoded MAC: {decodedMac}", 
