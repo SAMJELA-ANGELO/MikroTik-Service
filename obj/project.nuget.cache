@@ -1,8 +1,8 @@
 {
   "version": 2,
-  "dgSpecHash": "bhhYLNOy5zpCcqW1tmyGmt+NN7gUt/x2Fj4BD4nuNC95mA/wjY7ytBbJCb4d+PwiFz56XHyn5PTkS9yTpaf2Kg==",
+  "dgSpecHash": "w8XhBGXVG/tpKzM0SSNo7ZDS5MxhbkutF60qs+3jsZElra9+Q6beGAM5QLVYINvZvF5lh0WCr8RSaAQHf31diA==",
   "success": true,
-  "projectFilePath": "C:\\Users\\Splendidpips\\OneDrive\\Documents\\Splendid Stalink\\MikroTik-Service\\MikrotikService.csproj",
+  "projectFilePath": "C:\\Users\\Splendidpips\\OneDrive\\Documents\\splendid-starlink\\MikroTik\\MikrotikService.csproj",
   "expectedPackageFiles": [
     "C:\\Users\\Splendidpips\\.nuget\\packages\\microsoft.extensions.apidescription.server\\6.0.5\\microsoft.extensions.apidescription.server.6.0.5.nupkg.sha512",
     "C:\\Users\\Splendidpips\\.nuget\\packages\\microsoft.openapi\\1.2.3\\microsoft.openapi.1.2.3.nupkg.sha512",

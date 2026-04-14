@@ -4,6 +4,8 @@ using tik4net.Objects;
 using tik4net.Objects.Ip.Hotspot;
 using tik4net.Objects.System;
 using System.Linq;
+using System.Collections.Generic;
+using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 
 namespace MikrotikService.Services
@@ -91,101 +93,81 @@ namespace MikrotikService.Services
             }
         }
 
-        public void ActivateUser(string username, int durationHours)
+        public async Task ActivateUser(string username, int durationHours)
         {
+            _logger.LogInformation("🔄 ActivateUser START (PARALLEL MODE): username={username}, durationHours={durationHours}", username, durationHours);
+
             if (string.IsNullOrWhiteSpace(username))
                 throw new ArgumentException("Username is required");
 
-            // Use failover logic - try each router until one works
+            var activateTasks = new List<Task<(string RouterName, bool Success, string? Error)>>();
+
             for (int i = 0; i < routerIPs.Length; i++)
             {
-                string routerIP = routerIPs[i];
-                string routerName = routerNames.Length > i ? routerNames[i] : $"Router-{i}";
+                string capturedIP = routerIPs[i];
+                string capturedName = routerNames.Length > i ? routerNames[i] : $"Router-{i}";
+                activateTasks.Add(Task.Factory.StartNew(() => AttemptActivateUserOnRouter(capturedIP, capturedName, username, durationHours), TaskCreationOptions.LongRunning));
+            }
+
+            var errors = new List<string>();
+            while (activateTasks.Any())
+            {
+                var finishedTask = await Task.WhenAny(activateTasks);
+                activateTasks.Remove(finishedTask);
 
                 try
                 {
-                    _logger.LogInformation("🔄 [{routerName}] Attempting to activate user {username}...", routerName, username);
-                    using var connection = Connect(routerIP);
+                    var result = await finishedTask;
+                    if (result.Success)
+                    {
+                        _logger.LogInformation("✅ ActivateUser SUCCESS on {routerName} (PARALLEL)", result.RouterName);
 
-                    List<HotspotUser> users;
-                    try
-                    {
-                        users = connection.LoadList<HotspotUser>(connection.CreateParameter("name", username)).ToList();
-                    }
-                    catch (Exception ex)
-                    {
-                        if (IsEmptyResponseException(ex))
+                        if (activateTasks.Any())
                         {
-                            users = new List<HotspotUser>();
+                            _ = Task.WhenAll(activateTasks).ContinueWith(t =>
+                            {
+                                if (t.IsFaulted)
+                                {
+                                    _logger.LogWarning(t.Exception, "⚠️ Some background router activations failed, but primary succeeded.");
+                                }
+                            }, TaskContinuationOptions.OnlyOnFaulted);
                         }
-                        else
-                            throw;
+                        return;
                     }
 
-                    var profile = $"profile-{durationHours}h";
-
-                    // Ensure the requested profile exists on the device before assigning it.
-                    EnsureProfileExistsOnConnection(connection, profile);
-
-                    if (!HotspotProfileExists(connection, profile))
-                    {
-                        _logger.LogError("❌ [{routerName}] Profile {profile} was not found after creation", routerName, profile);
-                        throw new InvalidOperationException($"Hotspot profile '{profile}' could not be verified on router {routerIP}.");
-                    }
-
-                    if (users.Count == 0)
-                    {
-                        _logger.LogWarning("⚠️ [{routerName}] User {username} not found, trying next router...", routerName, username);
-                        continue; // Try next router
-                    }
-
-                    var user = users.First();
-
-                    var setCommand = connection.CreateCommand("/ip/hotspot/user/set");
-                    setCommand.AddParameter(".id", user.Id);
-                    setCommand.AddParameter("profile", profile);
-                    setCommand.AddParameter("limit-uptime", $"{durationHours}h");
-                    setCommand.AddParameter("disabled", "no");
-
-                    try
-                    {
-                        setCommand.ExecuteNonQuery();
-                        _logger.LogInformation("✅ [{routerName}] User {username} activated with {hours}h access", routerName, username, durationHours);
-                    }
-                    catch (Exception ex)
-                    {
-                        if (!IsEmptyResponseException(ex))
-                            throw;
-                        // else continue to verification
-                    }
-
-                    // Verification: ensure the user now exists on the device
-                    try
-                    {
-                        var verified = connection.LoadList<HotspotUser>(connection.CreateParameter("name", username)).FirstOrDefault();
-                        if (verified != null)
-                        {
-                            _logger.LogInformation("✅ [{routerName}] Activation verified for {username}", routerName, username);
-                            return; // Success - exit the method
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        if (!IsEmptyResponseException(ex))
-                            throw;
-                    }
-
-                    _logger.LogWarning("⚠️ [{routerName}] Activation verification failed, trying next router...", routerName);
+                    if (!string.IsNullOrWhiteSpace(result.Error))
+                        errors.Add(result.Error);
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "❌ [{routerName}] Activation failed: {message}", routerName, ex.Message);
-                    // Continue to next router
+                    errors.Add(ex.Message);
+                    _logger.LogWarning(ex, "⚠️ One router failed, checking next...");
                 }
             }
 
-            // If we get here, all routers failed
-            throw new Exception($"Failed to activate user '{username}' on any available router.");
+            string allErrors = errors.Any() ? string.Join("; ", errors) : "No router returned a successful activation.";
+            _logger.LogError("❌ Failed to activate {username} on any available router (parallel). Errors: {errors}", username, allErrors);
+            throw new Exception($"Failed to activate {username} on any available router. Errors:\n{allErrors}");
+        }
+
+        private (string RouterName, bool Success, string? Error) AttemptActivateUserOnRouter(
+            string routerIP, string routerName, string username, int durationHours)
+        {
+            _logger.LogInformation("🔄 [{routerName}] Attempting to activate user {username}...", routerName, username);
+            try
+            {
+                using var connection = ConnectToRouter(routerIP);
+                EnsureProfileExistsOnConnection(connection, $"profile-{durationHours}h");
+                ActivateUserOnConnection(connection, username, durationHours);
+                _logger.LogInformation("✅ [{routerName}] User {username} activated successfully", routerName, username);
+                return (routerName, true, null);
+            }
+            catch (Exception ex)
+            {
+                string errorMsg = $"{routerName}: {ex.Message}";
+                _logger.LogError(ex, "❌ [{routerName}] Activation failed: {message}", routerName, ex.Message);
+                return (routerName, false, errorMsg);
+            }
         }
 
 
@@ -259,594 +241,888 @@ namespace MikrotikService.Services
             }
         }
 
-        public void MoveHostToActive(string username, string password, string macAddress, string ip)
+        public async Task MoveHostToActive(string username, string password, string macAddress, string ip)
         {
+            _logger.LogInformation("🔄 MoveHostToActive START (PARALLEL MODE): username={username}", username);
+
             if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(password) ||
                 string.IsNullOrWhiteSpace(macAddress) || string.IsNullOrWhiteSpace(ip))
             {
                 throw new ArgumentException("Username, password, MAC address, and IP are required");
             }
 
-            // Try each router until one works
+            var moveTasks = new List<Task<(string RouterName, bool Success, string? Error)>>();
             for (int i = 0; i < routerIPs.Length; i++)
             {
-                string routerIP = routerIPs[i];
-                string routerName = routerNames.Length > i ? routerNames[i] : $"Router-{i}";
+                string capturedIP = routerIPs[i];
+                string capturedName = routerNames.Length > i ? routerNames[i] : $"Router-{i}";
+                moveTasks.Add(Task.Factory.StartNew(() => AttemptMoveHostToActiveOnRouter(capturedIP, capturedName, username, password, macAddress, ip), TaskCreationOptions.LongRunning));
+            }
+
+            var errors = new List<string>();
+            while (moveTasks.Any())
+            {
+                var finishedTask = await Task.WhenAny(moveTasks);
+                moveTasks.Remove(finishedTask);
 
                 try
                 {
-                    _logger.LogInformation("🔄 [{routerName}] Attempting to move host to active for {username}...", routerName, username);
-                    using var connection = Connect(routerIP);
-                    MoveHostToActive(connection, username, password, macAddress, ip);
-                    _logger.LogInformation("✅ [{routerName}] Host moved to active for {username}", routerName, username);
-                    return; // Success - exit the method
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "❌ [{routerName}] Failed to move host to active for {username}: {message}", routerName, username, ex.Message);
-                    // Continue to next router
-                }
-            }
-
-            throw new Exception($"Failed to move host to active for {username} on any available router.");
-        }
-
-        public void DeactivateUser(string username)
-        {
-            if (string.IsNullOrWhiteSpace(username))
-            {
-                throw new ArgumentException("Username is required");
-            }
-
-            // Try each router until one works
-            for (int i = 0; i < routerIPs.Length; i++)
-            {
-                string routerIP = routerIPs[i];
-                string routerName = routerNames.Length > i ? routerNames[i] : $"Router-{i}";
-
-                try
-                {
-                    _logger.LogInformation("🔄 [{routerName}] Attempting to deactivate user {username}...", routerName, username);
-                    using var connection = Connect(routerIP);
-
-                    var users = connection.LoadList<HotspotUser>(connection.CreateParameter("name", username)).ToList();
-
-                    if (users.Count > 0)
+                    var result = await finishedTask;
+                    if (result.Success)
                     {
-                        var user = users.First();
-                        var removeCommand = connection.CreateCommand("/ip/hotspot/user/remove");
-                        removeCommand.AddParameter(".id", user.Id);
+                        _logger.LogInformation("✅ MoveHostToActive SUCCESS on {routerName} (PARALLEL)", result.RouterName);
 
-                        try
+                        if (moveTasks.Any())
                         {
-                            removeCommand.ExecuteNonQuery();
-                            _logger.LogInformation("✅ [{routerName}] User {username} deactivated successfully", routerName, username);
-                            return; // Success - exit the method
-                        }
-                        catch (Exception ex)
-                        {
-                            if (IsEmptyResponseException(ex))
+                            _ = Task.WhenAll(moveTasks).ContinueWith(t =>
                             {
-                                _logger.LogInformation("✅ [{routerName}] User {username} deactivation verified (empty response)", routerName, username);
-                                return; // Success - exit the method
-                            }
-                            throw;
+                                if (t.IsFaulted)
+                                {
+                                    _logger.LogWarning(t.Exception, "⚠️ Some background router move attempts failed, but primary succeeded.");
+                                }
+                            }, TaskContinuationOptions.OnlyOnFaulted);
                         }
+                        return;
                     }
-                    else
-                    {
-                        _logger.LogWarning("⚠️ [{routerName}] User {username} not found, trying next router...", routerName, username);
-                        // Continue to next router
-                    }
+
+                    if (!string.IsNullOrWhiteSpace(result.Error))
+                        errors.Add(result.Error);
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "❌ [{routerName}] Failed to deactivate user {username}: {message}", routerName, username, ex.Message);
-                    // Continue to next router
+                    errors.Add(ex.Message);
+                    _logger.LogWarning(ex, "⚠️ One router failed, checking next...");
                 }
             }
 
-            throw new Exception($"Failed to deactivate user {username} on any available router.");
+            string allErrors = errors.Any() ? string.Join("; ", errors) : "No router returned a successful move.";
+            _logger.LogError("❌ Failed to move host to active for {username} on any available router (parallel). Errors: {errors}", username, allErrors);
+            throw new Exception($"Failed to move host to active for {username} on any available router. Errors:\n{allErrors}");
         }
 
-        public void CreateUser(string username, string password)
+        private (string RouterName, bool Success, string? Error) AttemptMoveHostToActiveOnRouter(
+            string routerIP, string routerName, string username, string password, string macAddress, string ip)
         {
-            if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(password))
+            _logger.LogInformation("🔄 [{routerName}] Attempting to move host to active for {username}...", routerName, username);
+            try
             {
-                throw new ArgumentException("Username and password are required");
+                using var connection = ConnectToRouter(routerIP);
+                MoveHostToActive(connection, username, password, macAddress, ip);
+                _logger.LogInformation("✅ [{routerName}] Host moved to active for {username}", routerName, username);
+                return (routerName, true, null);
             }
+            catch (Exception ex)
+            {
+                string errorMsg = $"{routerName}: {ex.Message}";
+                _logger.LogError(ex, "❌ [{routerName}] Failed to move host to active for {username}: {message}", routerName, username, ex.Message);
+                return (routerName, false, errorMsg);
+            }
+        }
 
-            // Try each router until one works
+        public async Task DeactivateUser(string username)
+        {
+            _logger.LogInformation("🔄 DeactivateUser START (PARALLEL MODE): username={username}", username);
+            
+            if (string.IsNullOrWhiteSpace(username))
+                throw new ArgumentException("Username is required");
+
+            // Create tasks for each router (parallel attempts)
+            var deactivateTasks = new List<Task<(string RouterName, bool Success, string? Error)>>();
+            
             for (int i = 0; i < routerIPs.Length; i++)
             {
-                string routerIP = routerIPs[i];
-                string routerName = routerNames.Length > i ? routerNames[i] : $"Router-{i}";
+                // CRITICAL: Capture in local variables to avoid closure bug
+                string capturedIP = routerIPs[i];
+                string capturedName = routerNames.Length > i ? routerNames[i] : $"Router-{i}";
+                
+                // Create a task for this router
+                var task = Task.Factory.StartNew(() => AttemptDeactivateUserOnRouter(capturedIP, capturedName, username), TaskCreationOptions.LongRunning);
+                deactivateTasks.Add(task);
+            }
+
+            // Try routers in parallel using WhenAny - first one to succeed wins
+            var errors = new List<string>();
+            while (deactivateTasks.Any())
+            {
+                var finishedTask = await Task.WhenAny(deactivateTasks);
+                deactivateTasks.Remove(finishedTask);
 
                 try
                 {
-                    _logger.LogInformation("🔄 [{routerName}] Attempting to create user {username}...", routerName, username);
-                    using var connection = Connect(routerIP);
-
-                    // Ensure the blocked profile exists
-                    EnsureProfileExistsOnConnection(connection, "profile-blocked");
-
-                    var addCommand = connection.CreateCommand("/ip/hotspot/user/add");
-                    addCommand.AddParameter("name", username);
-                    addCommand.AddParameter("password", password);
-                    addCommand.AddParameter("profile", "profile-blocked");
-                    addCommand.AddParameter("disabled", "yes");
-
-                    // Try to add the user; if tik4net throws the known '!empty' response error,
-                    // continue to verification step instead of failing immediately.
-                    try
+                    var result = await finishedTask;
+                    if (result.Success)
                     {
-                        addCommand.ExecuteNonQuery();
-                        _logger.LogInformation("✅ [{routerName}] User {username} created with blocked access and disabled until activation", routerName, username);
-                    }
-                    catch (Exception ex)
-                    {
-                        if (!IsEmptyResponseException(ex))
-                            throw;
-                        // fall through to verification
-                    }
-
-                    // Verify the user exists. If verification fails with '!empty', consider it success.
-                    try
-                    {
-                        var created = connection.LoadList<HotspotUser>(connection.CreateParameter("name", username)).FirstOrDefault();
-                        if (created == null)
+                        _logger.LogInformation("✅ DeactivateUser SUCCESS on {routerName} (PARALLEL)", result.RouterName);
+                        
+                        if (deactivateTasks.Any())
                         {
-                            throw new InvalidOperationException($"Failed to verify creation of user '{username}'");
+                            _ = Task.WhenAll(deactivateTasks).ContinueWith(t =>
+                            {
+                                if (t.IsFaulted)
+                                {
+                                    _logger.LogWarning(t.Exception, "⚠️ Some background router deactivations failed, but primary succeeded.");
+                                }
+                            }, TaskContinuationOptions.OnlyOnFaulted);
                         }
-                        _logger.LogInformation("✅ [{routerName}] User {username} creation verified", routerName, username);
-                        return; // Success - exit the method
+                        return;
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(result.Error))
+                        errors.Add(result.Error);
+                }
+                catch (Exception ex)
+                {
+                    errors.Add(ex.Message);
+                    _logger.LogWarning(ex, "⚠️ One router failed, checking next...");
+                }
+            }
+
+            string allErrors = errors.Any() ? string.Join("; ", errors) : "No router returned a successful deactivation.";
+            _logger.LogError("❌ Failed to deactivate {username} on any available router (parallel). Errors: {errors}", username, allErrors);
+            throw new Exception($"Failed to deactivate {username} on any available router. Errors:\n{allErrors}");
+        }
+
+        /// <summary>
+        /// Helper method: Attempt to deactivate user on a single router
+        /// </summary>
+        private (string RouterName, bool Success, string? Error) AttemptDeactivateUserOnRouter(
+            string routerIP, string routerName, string username)
+        {
+            _logger.LogInformation("🔄 [{routerName}] Attempting to deactivate user {username}...", routerName, username);
+
+            try
+            {
+                using var connection = ConnectToRouter(routerIP);
+
+                var users = connection.LoadList<HotspotUser>(connection.CreateParameter("name", username)).ToList();
+
+                if (users.Count > 0)
+                {
+                    var user = users.First();
+                    var removeCommand = connection.CreateCommand("/ip/hotspot/user/remove");
+                    removeCommand.AddParameter(".id", user.Id);
+
+                    try
+                    {
+                        removeCommand.ExecuteNonQuery();
+                        _logger.LogInformation("✅ [{routerName}] User {username} deactivated successfully", routerName, username);
+                        return (routerName, true, null);
                     }
                     catch (Exception ex)
                     {
                         if (IsEmptyResponseException(ex))
                         {
-                            _logger.LogInformation("✅ [{routerName}] User {username} creation verified (empty response)", routerName, username);
-                            return; // assume success when device responds with '!empty'
+                            _logger.LogInformation("✅ [{routerName}] User {username} deactivation verified (empty response)", routerName, username);
+                            return (routerName, true, null);
                         }
                         throw;
                     }
                 }
-                catch (Exception ex)
+                else
                 {
-                    _logger.LogError(ex, "❌ [{routerName}] Failed to create user {username}: {message}", routerName, username, ex.Message);
-                    // Continue to next router
+                    _logger.LogWarning("⚠️ [{routerName}] User {username} not found", routerName, username);
+                    return (routerName, false, $"User {username} not found on {routerName}");
                 }
             }
-
-            throw new Exception($"Failed to create user {username} on any available router.");
+            catch (Exception ex)
+            {
+                string errorMsg = $"{routerName}: {ex.Message}";
+                _logger.LogError(ex, "❌ [{routerName}] Failed to deactivate user {username}: {message}", routerName, username, ex.Message);
+                return (routerName, false, errorMsg);
+            }
         }
 
-        public void DeleteUser(string username)
+        public async Task CreateUser(string username, string password)
         {
-            if (string.IsNullOrWhiteSpace(username))
+            _logger.LogInformation("🟢 CreateUser START (PARALLEL MODE): username={username}", username);
+
+            if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(password))
             {
-                throw new ArgumentException("Username is required");
+                throw new ArgumentException("Username and password are required");
             }
 
-            // Try each router until one works
+            var createTasks = new List<Task<(string RouterName, bool Success, string? Error)>>();
             for (int i = 0; i < routerIPs.Length; i++)
             {
-                string routerIP = routerIPs[i];
-                string routerName = routerNames.Length > i ? routerNames[i] : $"Router-{i}";
+                string capturedIP = routerIPs[i];
+                string capturedName = routerNames.Length > i ? routerNames[i] : $"Router-{i}";
+                createTasks.Add(Task.Factory.StartNew(() => AttemptCreateUserOnRouter(capturedIP, capturedName, username, password), TaskCreationOptions.LongRunning));
+            }
+
+            var errors = new List<string>();
+            while (createTasks.Any())
+            {
+                var finishedTask = await Task.WhenAny(createTasks);
+                createTasks.Remove(finishedTask);
 
                 try
                 {
-                    _logger.LogInformation("🔄 [{routerName}] Attempting to delete user {username}...", routerName, username);
-                    using var connection = Connect(routerIP);
-
-                    var user = connection.LoadList<HotspotUser>(connection.CreateParameter("name", username)).FirstOrDefault();
-                    if (user == null)
+                    var result = await finishedTask;
+                    if (result.Success)
                     {
-                        _logger.LogWarning("⚠️ [{routerName}] User {username} not found, trying next router...", routerName, username);
-                        continue; // Try next router
+                        _logger.LogInformation("✅ CreateUser SUCCESS on {routerName} (PARALLEL)", result.RouterName);
+
+                        if (createTasks.Any())
+                        {
+                            _ = Task.WhenAll(createTasks).ContinueWith(t =>
+                            {
+                                if (t.IsFaulted)
+                                {
+                                    _logger.LogWarning(t.Exception, "⚠️ Some background router create attempts failed, but primary succeeded.");
+                                }
+                            }, TaskContinuationOptions.OnlyOnFaulted);
+                        }
+                        return;
                     }
 
-                    var removeCommand = connection.CreateCommand("/ip/hotspot/user/remove");
-                    removeCommand.AddParameter(".id", user.Id);
-                    removeCommand.ExecuteNonQuery();
+                    if (!string.IsNullOrWhiteSpace(result.Error))
+                        errors.Add(result.Error);
+                }
+                catch (Exception ex)
+                {
+                    errors.Add(ex.Message);
+                    _logger.LogWarning(ex, "⚠️ One router failed, checking next...");
+                }
+            }
 
-                    _logger.LogInformation("✅ [{routerName}] User {username} deleted successfully", routerName, username);
-                    return; // Success - exit the method
+            string allErrors = errors.Any() ? string.Join("; ", errors) : "No router returned a successful create.";
+            _logger.LogError("❌ Failed to create {username} on any available router (parallel). Errors: {errors}", username, allErrors);
+            throw new Exception($"Failed to create user {username} on any available router. Errors:\n{allErrors}");
+        }
+
+        private (string RouterName, bool Success, string? Error) AttemptCreateUserOnRouter(
+            string routerIP, string routerName, string username, string password)
+        {
+            _logger.LogInformation("🔄 [{routerName}] Attempting to create user {username}...", routerName, username);
+            try
+            {
+                using var connection = ConnectToRouter(routerIP);
+                EnsureProfileExistsOnConnection(connection, "profile-blocked");
+
+                var addCommand = connection.CreateCommand("/ip/hotspot/user/add");
+                addCommand.AddParameter("name", username);
+                addCommand.AddParameter("password", password);
+                addCommand.AddParameter("profile", "profile-blocked");
+                addCommand.AddParameter("disabled", "yes");
+
+                try
+                {
+                    addCommand.ExecuteNonQuery();
+                    _logger.LogInformation("✅ [{routerName}] User {username} created with blocked access and disabled until activation", routerName, username);
+                }
+                catch (Exception ex)
+                {
+                    if (!IsEmptyResponseException(ex))
+                        throw;
+                    _logger.LogInformation("   ℹ️ User creation returned empty response, proceeding to verification");
+                }
+
+                try
+                {
+                    var created = connection.LoadList<HotspotUser>(connection.CreateParameter("name", username)).FirstOrDefault();
+                    if (created == null)
+                        throw new InvalidOperationException($"Failed to verify creation of user '{username}'");
+
+                    _logger.LogInformation("✅ [{routerName}] User {username} creation verified", routerName, username);
+                    return (routerName, true, null);
                 }
                 catch (Exception ex)
                 {
                     if (IsEmptyResponseException(ex))
                     {
-                        _logger.LogInformation("✅ [{routerName}] User {username} deletion verified (empty response)", routerName, username);
-                        return; // Success - exit the method
+                        _logger.LogInformation("✅ [{routerName}] User {username} creation verified (empty response)", routerName, username);
+                        return (routerName, true, null);
                     }
-                    _logger.LogError(ex, "❌ [{routerName}] Failed to delete user {username}: {message}", routerName, username, ex.Message);
-                    // Continue to next router
+                    throw;
                 }
             }
-
-            throw new Exception($"Failed to delete user {username} on any available router.");
+            catch (Exception ex)
+            {
+                string errorMsg = $"{routerName}: {ex.Message}";
+                _logger.LogError(ex, "❌ [{routerName}] Failed to create user {username}: {message}", routerName, username, ex.Message);
+                return (routerName, false, errorMsg);
+            }
         }
 
-        public void DisableUser(string username)
+        public async Task DeleteUser(string username)
         {
+            _logger.LogInformation("🗑️ DeleteUser START (PARALLEL MODE): username={username}", username);
+            
             if (string.IsNullOrWhiteSpace(username))
                 throw new ArgumentException("Username is required");
 
-            // Try each router until one works
+            // Create tasks for each router (parallel attempts)
+            var deleteTasks = new List<Task<(string RouterName, bool Success, string? Error)>>();
+            
             for (int i = 0; i < routerIPs.Length; i++)
             {
-                string routerIP = routerIPs[i];
-                string routerName = routerNames.Length > i ? routerNames[i] : $"Router-{i}";
+                // CRITICAL: Capture in local variables to avoid closure bug
+                string capturedIP = routerIPs[i];
+                string capturedName = routerNames.Length > i ? routerNames[i] : $"Router-{i}";
+                
+                // Create a task for this router
+                var task = Task.Factory.StartNew(() => AttemptDeleteUserOnRouter(capturedIP, capturedName, username), TaskCreationOptions.LongRunning);
+                deleteTasks.Add(task);
+            }
+
+            // Try routers in parallel using WhenAny - first one to succeed wins
+            var errors = new List<string>();
+            while (deleteTasks.Any())
+            {
+                var finishedTask = await Task.WhenAny(deleteTasks);
+                deleteTasks.Remove(finishedTask);
 
                 try
                 {
-                    _logger.LogInformation("🔄 [{routerName}] Attempting to disable user {username}...", routerName, username);
-                    using var connection = Connect(routerIP);
-
-                    var users = connection.LoadList<HotspotUser>(connection.CreateParameter("name", username)).ToList();
-
-                    if (users.Count == 0)
+                    var result = await finishedTask;
+                    if (result.Success)
                     {
-                        _logger.LogWarning("⚠️ [{routerName}] User {username} not found, trying next router...", routerName, username);
-                        continue; // Try next router
+                        _logger.LogInformation("✅ DeleteUser SUCCESS on {routerName} (PARALLEL)", result.RouterName);
+                        
+                        if (deleteTasks.Any())
+                        {
+                            _ = Task.WhenAll(deleteTasks).ContinueWith(t =>
+                            {
+                                if (t.IsFaulted)
+                                {
+                                    _logger.LogWarning(t.Exception, "⚠️ Some background router deletions failed, but primary succeeded.");
+                                }
+                            }, TaskContinuationOptions.OnlyOnFaulted);
+                        }
+                        return;
                     }
 
-                    var user = users.First();
-                    var setCommand = connection.CreateCommand("/ip/hotspot/user/set");
-                    setCommand.AddParameter(".id", user.Id);
-                    setCommand.AddParameter("disabled", "yes");
-
-                    try
-                    {
-                        setCommand.ExecuteNonQuery();
-                        _logger.LogInformation("✅ [{routerName}] User {username} disabled successfully", routerName, username);
-                    }
-                    catch (Exception ex)
-                    {
-                        if (!IsEmptyResponseException(ex))
-                            throw;
-                        // else continue
-                    }
-
-                    // Verify the user is now disabled
-                    var verified = connection.LoadList<HotspotUser>(connection.CreateParameter("name", username)).FirstOrDefault();
-                    if (verified != null)
-                    {
-                        _logger.LogInformation("✅ [{routerName}] User {username} disable verified", routerName, username);
-                        return; // Success - exit the method
-                    }
+                    if (!string.IsNullOrWhiteSpace(result.Error))
+                        errors.Add(result.Error);
                 }
                 catch (Exception ex)
                 {
-                    if (IsEmptyResponseException(ex))
-                    {
-                        _logger.LogInformation("✅ [{routerName}] User {username} disable verified (empty response)", routerName, username);
-                        return; // Success - exit the method
-                    }
-                    _logger.LogError(ex, "❌ [{routerName}] Failed to disable user {username}: {message}", routerName, username, ex.Message);
-                    // Continue to next router
+                    errors.Add(ex.Message);
+                    _logger.LogWarning(ex, "⚠️ One router failed, checking next...");
                 }
             }
 
-            throw new Exception($"Failed to disable user {username} on any available router.");
+            string allErrors = errors.Any() ? string.Join("; ", errors) : "No router returned a successful deletion.";
+            _logger.LogError("❌ Failed to delete {username} on any available router (parallel). Errors: {errors}", username, allErrors);
+            throw new Exception($"Failed to delete {username} on any available router. Errors:\n{allErrors}");
         }
 
-        public object TestConnection()
+        /// <summary>
+        /// Helper method: Attempt to delete user on a single router
+        /// </summary>
+        private (string RouterName, bool Success, string? Error) AttemptDeleteUserOnRouter(
+            string routerIP, string routerName, string username)
         {
-            // Try each router until one works
+            _logger.LogInformation("🔄 [{routerName}] Attempting to delete user {username}...", routerName, username);
+
+            try
+            {
+                using var connection = ConnectToRouter(routerIP);
+
+                var user = connection.LoadList<HotspotUser>(connection.CreateParameter("name", username)).FirstOrDefault();
+                if (user == null)
+                {
+                    _logger.LogWarning("⚠️ [{routerName}] User {username} not found", routerName, username);
+                    return (routerName, false, $"User {username} not found on {routerName}");
+                }
+
+                var removeCommand = connection.CreateCommand("/ip/hotspot/user/remove");
+                removeCommand.AddParameter(".id", user.Id);
+                removeCommand.ExecuteNonQuery();
+
+                _logger.LogInformation("✅ [{routerName}] User {username} deleted successfully", routerName, username);
+                return (routerName, true, null);
+            }
+            catch (Exception ex)
+            {
+                if (IsEmptyResponseException(ex))
+                {
+                    _logger.LogInformation("✅ [{routerName}] User {username} deletion verified (empty response)", routerName, username);
+                    return (routerName, true, null);
+                }
+                
+                string errorMsg = $"{routerName}: {ex.Message}";
+                _logger.LogError(ex, "❌ [{routerName}] Failed to delete user {username}: {message}", routerName, username, ex.Message);
+                return (routerName, false, errorMsg);
+            }
+        }
+
+        public async Task DisableUser(string username)
+        {
+            _logger.LogInformation("🔒 DisableUser START (PARALLEL MODE): username={username}", username);
+            
+            if (string.IsNullOrWhiteSpace(username))
+                throw new ArgumentException("Username is required");
+
+            // Create tasks for each router (parallel attempts)
+            var disableTasks = new List<Task<(string RouterName, bool Success, string? Error)>>();
+            
             for (int i = 0; i < routerIPs.Length; i++)
             {
-                string routerIP = routerIPs[i];
-                string routerName = routerNames.Length > i ? routerNames[i] : $"Router-{i}";
+                // CRITICAL: Capture in local variables to avoid closure bug
+                string capturedIP = routerIPs[i];
+                string capturedName = routerNames.Length > i ? routerNames[i] : $"Router-{i}";
+                
+                // Create a task for this router
+                var task = Task.Factory.StartNew(() => AttemptDisableUserOnRouter(capturedIP, capturedName, username), TaskCreationOptions.LongRunning);
+                disableTasks.Add(task);
+            }
+
+            // Try routers in parallel using WhenAny - first one to succeed wins
+            var errors = new List<string>();
+            while (disableTasks.Any())
+            {
+                var finishedTask = await Task.WhenAny(disableTasks);
+                disableTasks.Remove(finishedTask);
 
                 try
                 {
-                    _logger.LogInformation("🔄 [{routerName}] Testing connection...", routerName);
-                    using var connection = Connect(routerIP);
-                    var identity = connection.LoadAll<SystemIdentity>().First();
-                    _logger.LogInformation("✅ [{routerName}] Connection test successful: {identity}", routerName, identity.Name);
-                    return new { connected = true, identity = identity.Name, router = routerName };
+                    var result = await finishedTask;
+                    if (result.Success)
+                    {
+                        _logger.LogInformation("✅ DisableUser SUCCESS on {routerName} (PARALLEL)", result.RouterName);
+                        
+                        if (disableTasks.Any())
+                        {
+                            _ = Task.WhenAll(disableTasks).ContinueWith(t =>
+                            {
+                                if (t.IsFaulted)
+                                {
+                                    _logger.LogWarning(t.Exception, "⚠️ Some background router disables failed, but primary succeeded.");
+                                }
+                            }, TaskContinuationOptions.OnlyOnFaulted);
+                        }
+                        return;
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(result.Error))
+                        errors.Add(result.Error);
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "❌ [{routerName}] Connection test failed: {message}", routerName, ex.Message);
-                    // Continue to next router
+                    errors.Add(ex.Message);
+                    _logger.LogWarning(ex, "⚠️ One router failed, checking next...");
                 }
             }
 
+            string allErrors = errors.Any() ? string.Join("; ", errors) : "No router returned a successful disable.";
+            _logger.LogError("❌ Failed to disable {username} on any available router (parallel). Errors: {errors}", username, allErrors);
+            throw new Exception($"Failed to disable {username} on any available router. Errors:\n{allErrors}");
+        }
+
+        /// <summary>
+        /// Helper method: Attempt to disable user on a single router
+        /// </summary>
+        private (string RouterName, bool Success, string? Error) AttemptDisableUserOnRouter(
+            string routerIP, string routerName, string username)
+        {
+            _logger.LogInformation("🔄 [{routerName}] Attempting to disable user {username}...", routerName, username);
+
+            try
+            {
+                using var connection = ConnectToRouter(routerIP);
+
+                var users = connection.LoadList<HotspotUser>(connection.CreateParameter("name", username)).ToList();
+
+                if (users.Count == 0)
+                {
+                    _logger.LogWarning("⚠️ [{routerName}] User {username} not found", routerName, username);
+                    return (routerName, false, $"User {username} not found on {routerName}");
+                }
+
+                var user = users.First();
+                var setCommand = connection.CreateCommand("/ip/hotspot/user/set");
+                setCommand.AddParameter(".id", user.Id);
+                setCommand.AddParameter("disabled", "yes");
+
+                try
+                {
+                    setCommand.ExecuteNonQuery();
+                    _logger.LogInformation("✅ [{routerName}] User {username} disabled successfully", routerName, username);
+                }
+                catch (Exception ex)
+                {
+                    if (!IsEmptyResponseException(ex))
+                        throw;
+                }
+
+                // Verify the user is now disabled
+                var verified = connection.LoadList<HotspotUser>(connection.CreateParameter("name", username)).FirstOrDefault();
+                if (verified != null)
+                {
+                    _logger.LogInformation("✅ [{routerName}] User {username} disable verified", routerName, username);
+                    return (routerName, true, null);
+                }
+                
+                return (routerName, false, "Disable verification failed");
+            }
+            catch (Exception ex)
+            {
+                if (IsEmptyResponseException(ex))
+                {
+                    _logger.LogInformation("✅ [{routerName}] User {username} disable verified (empty response)", routerName, username);
+                    return (routerName, true, null);
+                }
+                
+                string errorMsg = $"{routerName}: {ex.Message}";
+                _logger.LogError(ex, "❌ [{routerName}] Failed to disable user {username}: {message}", routerName, username, ex.Message);
+                return (routerName, false, errorMsg);
+            }
+        }
+
+        public async Task<object> TestConnection()
+        {
+            var testTasks = new List<Task<(string RouterName, bool Success, string? Identity)>>();
+            for (int i = 0; i < routerIPs.Length; i++)
+            {
+                string capturedIP = routerIPs[i];
+                string capturedName = routerNames.Length > i ? routerNames[i] : $"Router-{i}";
+                var task = Task.Factory.StartNew(() => 
+                {
+                    try {
+                        using var conn = ConnectToRouter(capturedIP);
+                        var id = conn.LoadAll<SystemIdentity>().FirstOrDefault();
+                        return (capturedName, true, id?.Name);
+                    } catch (Exception ex) {
+                        _logger.LogWarning(ex, "⚠️ [{routerName}] Test failed", capturedName);
+                        return (capturedName, false, (string?)null);
+                    }
+                }, TaskCreationOptions.LongRunning);
+                testTasks.Add(task);
+            }
+            while (testTasks.Any())
+            {
+                var finished = await Task.WhenAny(testTasks);
+                testTasks.Remove(finished);
+                var result = await finished;
+                if (result.Success)
+                {
+                    _logger.LogInformation("✅ TestConnection SUCCESS on {routerName}", result.RouterName);
+                    return new { connected = true, identity = result.Identity, router = result.RouterName };
+                }
+            }
             return new { connected = false, error = "No routers available" };
         }
 
-        public List<HotspotUser> ListHotspotUsers()
+        public async Task<List<HotspotUser>> ListHotspotUsers()
         {
-            // Try each router until one works
+            var listTasks = new List<Task<(string RouterName, List<HotspotUser> Users)>>();
             for (int i = 0; i < routerIPs.Length; i++)
             {
-                string routerIP = routerIPs[i];
-                string routerName = routerNames.Length > i ? routerNames[i] : $"Router-{i}";
-
-                try
+                string capturedIP = routerIPs[i];
+                string capturedName = routerNames.Length > i ? routerNames[i] : $"Router-{i}";
+                var task = Task.Factory.StartNew(() => 
                 {
-                    _logger.LogInformation("🔄 [{routerName}] Attempting to list hotspot users...", routerName);
-                    using var connection = Connect(routerIP);
-                    var users = connection.LoadAll<HotspotUser>().ToList();
-                    _logger.LogInformation("✅ [{routerName}] Retrieved {count} hotspot users", routerName, users.Count);
-                    return users;
-                }
-                catch (Exception ex)
+                    try {
+                        using var conn = ConnectToRouter(capturedIP);
+                        var users = conn.LoadAll<HotspotUser>().ToList();
+                        return (capturedName, users);
+                    } catch (Exception ex) {
+                        _logger.LogWarning(ex, "⚠️ [{routerName}] List failed", capturedName);
+                        return (capturedName, new List<HotspotUser>());
+                    }
+                }, TaskCreationOptions.LongRunning);
+                listTasks.Add(task);
+            }
+            while (listTasks.Any())
+            {
+                var finished = await Task.WhenAny(listTasks);
+                listTasks.Remove(finished);
+                var result = await finished;
+                if (result.Users.Count > 0)
                 {
-                    _logger.LogError(ex, "❌ [{routerName}] Failed to list hotspot users: {message}", routerName, ex.Message);
-                    // Continue to next router
+                    _logger.LogInformation("✅ ListHotspotUsers SUCCESS on {routerName}", result.RouterName);
+                    return result.Users;
                 }
             }
-
             throw new Exception("Failed to list hotspot users from any available router.");
         }
 
-        public HotspotUser GetUserDetails(string username)
+        public async Task<HotspotUser> GetUserDetails(string username)
         {
             if (string.IsNullOrWhiteSpace(username))
-            {
                 throw new ArgumentException("Username is required");
-            }
 
-            // Try each router until one works
+            var detailsTasks = new List<Task<(string RouterName, HotspotUser User)>>();
             for (int i = 0; i < routerIPs.Length; i++)
             {
-                string routerIP = routerIPs[i];
-                string routerName = routerNames.Length > i ? routerNames[i] : $"Router-{i}";
-
-                try
+                string capturedIP = routerIPs[i];
+                string capturedName = routerNames.Length > i ? routerNames[i] : $"Router-{i}";
+                var task = Task.Factory.StartNew(() => 
                 {
-                    _logger.LogInformation("🔄 [{routerName}] Attempting to get user details for {username}...", routerName, username);
-                    using var connection = Connect(routerIP);
+                    try {
+                        using var conn = ConnectToRouter(capturedIP);
+                        var user = conn.LoadList<HotspotUser>(conn.CreateParameter("name", username)).FirstOrDefault();
 #pragma warning disable CS8603
-                    var user = connection.LoadList<HotspotUser>(connection.CreateParameter("name", username)).FirstOrDefault();
+                        return (capturedName, user);
 #pragma warning restore CS8603
-                    if (user != null)
-                    {
-                        _logger.LogInformation("✅ [{routerName}] Retrieved user details for {username}", routerName, username);
-                        return user;
+                    } catch (Exception ex) {
+                        _logger.LogWarning(ex, "⚠️ [{routerName}] Details query failed", capturedName);
+                        return (capturedName, (HotspotUser)null);
                     }
-                    else
-                    {
-                        _logger.LogWarning("⚠️ [{routerName}] User {username} not found, trying next router...", routerName, username);
-                        // Continue to next router
-                    }
-                }
-                catch (Exception ex)
+                }, TaskCreationOptions.LongRunning);
+                detailsTasks.Add(task);
+            }
+            while (detailsTasks.Any())
+            {
+                var finished = await Task.WhenAny(detailsTasks);
+                detailsTasks.Remove(finished);
+                var result = await finished;
+                if (result.User != null)
                 {
-                    _logger.LogError(ex, "❌ [{routerName}] Failed to get user details for {username}: {message}", routerName, username, ex.Message);
-                    // Continue to next router
+                    _logger.LogInformation("✅ GetUserDetails SUCCESS on {routerName}", result.RouterName);
+                    return result.User;
                 }
             }
-
-            return null; // User not found on any router
+            return null;
         }
 
-        public List<HotspotActive> GetActiveUsers()
+        public async Task<List<HotspotActive>> GetActiveUsers()
         {
-            // Try each router until one works
+            var activeTasks = new List<Task<(string RouterName, List<HotspotActive> Users)>>();
             for (int i = 0; i < routerIPs.Length; i++)
             {
-                string routerIP = routerIPs[i];
-                string routerName = routerNames.Length > i ? routerNames[i] : $"Router-{i}";
-
-                try
+                string capturedIP = routerIPs[i];
+                string capturedName = routerNames.Length > i ? routerNames[i] : $"Router-{i}";
+                var task = Task.Factory.StartNew(() => 
                 {
-                    _logger.LogInformation("🔄 [{routerName}] Attempting to get active users...", routerName);
-                    using var connection = Connect(routerIP);
-                    var activeUsers = connection.LoadAll<HotspotActive>().ToList();
-                    _logger.LogInformation("✅ [{routerName}] Retrieved {count} active users", routerName, activeUsers.Count);
-                    return activeUsers;
-                }
-                catch (Exception ex)
+                    try {
+                        using var conn = ConnectToRouter(capturedIP);
+                        var users = conn.LoadAll<HotspotActive>().ToList();
+                        return (capturedName, users);
+                    } catch (Exception ex) {
+                        _logger.LogWarning(ex, "⚠️ [{routerName}] Active query failed", capturedName);
+                        return (capturedName, new List<HotspotActive>());
+                    }
+                }, TaskCreationOptions.LongRunning);
+                activeTasks.Add(task);
+            }
+            while (activeTasks.Any())
+            {
+                var finished = await Task.WhenAny(activeTasks);
+                activeTasks.Remove(finished);
+                var result = await finished;
+                if (result.Users.Count > 0)
                 {
-                    _logger.LogError(ex, "❌ [{routerName}] Failed to get active users: {message}", routerName, ex.Message);
-                    // Continue to next router
+                    _logger.LogInformation("✅ GetActiveUsers SUCCESS on {routerName}", result.RouterName);
+                    return result.Users;
                 }
             }
-
             throw new Exception("Failed to get active users from any available router.");
         }
 
-        public void BindMacToBypass(string macAddress, int durationHours)
+        public async Task BindMacToBypass(string macAddress, int durationHours)
         {
             if (string.IsNullOrWhiteSpace(macAddress))
                 throw new ArgumentException("MAC address is required");
 
-            // Try each router until one works
+            var bindingTasks = new List<Task<(string RouterName, bool Success, string? Error)>>();
             for (int i = 0; i < routerIPs.Length; i++)
             {
-                string routerIP = routerIPs[i];
-                string routerName = routerNames.Length > i ? routerNames[i] : $"Router-{i}";
-
-                try
+                string capturedIP = routerIPs[i];
+                string capturedName = routerNames.Length > i ? routerNames[i] : $"Router-{i}";
+                var task = Task.Factory.StartNew(() => 
                 {
-                    _logger.LogInformation("🔄 [{routerName}] Attempting to bind MAC {macAddress} to bypass...", routerName, macAddress);
-                    using var connection = Connect(routerIP);
-
-                    // Check if binding already exists
-                    var existingBindings = connection.LoadList<dynamic>(
-                        connection.CreateParameter("mac-address", macAddress)
-                    ).ToList();
-
-                    // Remove old binding if exists
-                    if (existingBindings != null && existingBindings.Count > 0)
-                    {
-                        var bindingCommand = connection.CreateCommand("/ip/hotspot/ip-binding/remove");
-                        bindingCommand.AddParameter(".id", existingBindings[0].Id);
-                        try
-                        {
-                            bindingCommand.ExecuteNonQuery();
-                            _logger.LogInformation("✅ [{routerName}] Removed existing binding for MAC {macAddress}", routerName, macAddress);
+                    try {
+                        using var conn = ConnectToRouter(capturedIP);
+                        var existing = conn.LoadList<dynamic>(conn.CreateParameter("mac-address", macAddress)).ToList();
+                        if (existing?.Count > 0) {
+                            var rmCmd = conn.CreateCommand("/ip/hotspot/ip-binding/remove");
+                            rmCmd.AddParameter(".id", existing[0].Id);
+                            try { rmCmd.ExecuteNonQuery(); }
+                            catch (Exception ex) { if (!IsEmptyResponseException(ex)) throw; }
                         }
-                        catch (Exception ex)
-                        {
-                            if (!IsEmptyResponseException(ex))
-                                throw;
-                        }
-                    }
-
-                    // Add new binding with bypass type
-                    var addCommand = connection.CreateCommand("/ip/hotspot/ip-binding/add");
-                    addCommand.AddParameter("mac-address", macAddress);
-                    addCommand.AddParameter("type", "bypassed");
-                    if (durationHours > 0)
-                    {
-                        addCommand.AddParameter("timeout", $"{durationHours}h");
-                    }
-
-                    try
-                    {
-                        addCommand.ExecuteNonQuery();
-                        _logger.LogInformation("✅ [{routerName}] MAC {macAddress} bound to bypass successfully", routerName, macAddress);
-                        return; // Success - exit the method
-                    }
-                    catch (Exception ex)
-                    {
-                        if (!IsEmptyResponseException(ex))
-                            throw;
-                        // else continue
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "❌ [{routerName}] Failed to bind MAC {macAddress} to bypass: {message}", routerName, macAddress, ex.Message);
-                    // Continue to next router
-                }
+                        var addCmd = conn.CreateCommand("/ip/hotspot/ip-binding/add");
+                        addCmd.AddParameter("mac-address", macAddress);
+                        addCmd.AddParameter("type", "bypassed");
+                        if (durationHours > 0) addCmd.AddParameter("timeout", $"{durationHours}h");
+                        try { addCmd.ExecuteNonQuery(); }
+                        catch (Exception ex) { if (!IsEmptyResponseException(ex)) throw; }
+                        return (capturedName, true, (string?)null);
+                    } catch (Exception ex) { return (capturedName, false, ex.Message); }
+                }, TaskCreationOptions.LongRunning);
+                bindingTasks.Add(task);
             }
 
-            throw new Exception($"Failed to bind MAC address {macAddress} to bypass on any available router.");
+            var errors = new List<string>();
+            while (bindingTasks.Any())
+            {
+                var finishedTask = await Task.WhenAny(bindingTasks);
+                bindingTasks.Remove(finishedTask);
+                try {
+                    var result = await finishedTask;
+                    if (result.Success) {
+                        _logger.LogInformation("✅ BindMacToBypass SUCCESS on {routerName}", result.RouterName);
+                        if (bindingTasks.Any())
+                            _ = Task.WhenAll(bindingTasks).ContinueWith(t => {
+                                if (t.IsFaulted) _logger.LogWarning(t.Exception, "⚠️ Background bind failed");
+                            }, TaskContinuationOptions.OnlyOnFaulted);
+                        return;
+                    }
+                    if (result.Error != null) errors.Add(result.Error);
+                } catch (Exception ex) { errors.Add(ex.Message); }
+            }
+            throw new Exception($"Failed to bind MAC {macAddress}: {string.Join("; ", errors)}");
         }
 
-        public void UnbindMac(string macAddress)
+        public async Task UnbindMac(string macAddress)
         {
             if (string.IsNullOrWhiteSpace(macAddress))
                 throw new ArgumentException("MAC address is required");
 
-            // Try each router until one works
+            var unbindingTasks = new List<Task<(string RouterName, bool Success, string? Error)>>();
             for (int i = 0; i < routerIPs.Length; i++)
             {
-                string routerIP = routerIPs[i];
-                string routerName = routerNames.Length > i ? routerNames[i] : $"Router-{i}";
-
-                try
+                string capturedIP = routerIPs[i];
+                string capturedName = routerNames.Length > i ? routerNames[i] : $"Router-{i}";
+                var task = Task.Factory.StartNew(() => 
                 {
-                    _logger.LogInformation("🔄 [{routerName}] Attempting to unbind MAC {macAddress}...", routerName, macAddress);
-                    using var connection = Connect(routerIP);
-
-                    // Find and remove the binding
-                    var bindings = connection.LoadList<dynamic>(
-                        connection.CreateParameter("mac-address", macAddress)
-                    ).ToList();
-
-                    if (bindings != null && bindings.Count > 0)
-                    {
-                        var removeCommand = connection.CreateCommand("/ip/hotspot/ip-binding/remove");
-                        removeCommand.AddParameter(".id", bindings[0].Id);
-
-                        try
-                        {
-                            removeCommand.ExecuteNonQuery();
-                            _logger.LogInformation("✅ [{routerName}] MAC {macAddress} unbound successfully", routerName, macAddress);
-                            return; // Success - exit the method
+                    try {
+                        using var conn = ConnectToRouter(capturedIP);
+                        var bindings = conn.LoadList<dynamic>(conn.CreateParameter("mac-address", macAddress)).ToList();
+                        if (bindings?.Count > 0) {
+                            var rmCmd = conn.CreateCommand("/ip/hotspot/ip-binding/remove");
+                            rmCmd.AddParameter(".id", bindings[0].Id);
+                            try { rmCmd.ExecuteNonQuery(); }
+                            catch (Exception ex) { if (!IsEmptyResponseException(ex)) throw; }
+                            return (capturedName, true, (string?)null);
                         }
-                        catch (Exception ex)
-                        {
-                            if (!IsEmptyResponseException(ex))
-                                throw;
-                            // else continue
-                        }
-                    }
-                    else
-                    {
-                        _logger.LogWarning("⚠️ [{routerName}] MAC {macAddress} binding not found, trying next router...", routerName, macAddress);
-                        // Continue to next router
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "❌ [{routerName}] Failed to unbind MAC {macAddress}: {message}", routerName, macAddress, ex.Message);
-                    // Continue to next router
-                }
+                        return (capturedName, false, $"MAC {macAddress} not found");
+                    } catch (Exception ex) { return (capturedName, false, ex.Message); }
+                }, TaskCreationOptions.LongRunning);
+                unbindingTasks.Add(task);
             }
 
-            throw new Exception($"Failed to unbind MAC address {macAddress} on any available router.");
+            var errors = new List<string>();
+            while (unbindingTasks.Any())
+            {
+                var finishedTask = await Task.WhenAny(unbindingTasks);
+                unbindingTasks.Remove(finishedTask);
+                try {
+                    var result = await finishedTask;
+                    if (result.Success) {
+                        _logger.LogInformation("✅ UnbindMac SUCCESS on {routerName}", result.RouterName);
+                        if (unbindingTasks.Any())
+                            _ = Task.WhenAll(unbindingTasks).ContinueWith(t => {
+                                if (t.IsFaulted) _logger.LogWarning(t.Exception, "⚠️ Background unbind failed");
+                            }, TaskContinuationOptions.OnlyOnFaulted);
+                        return;
+                    }
+                    if (result.Error != null) errors.Add(result.Error);
+                } catch (Exception ex) { errors.Add(ex.Message); }
+            }
+            throw new Exception($"Failed to unbind MAC {macAddress}: {string.Join("; ", errors)}");
         }
 
         /// <summary>
         /// FAILOVER METHOD: Tries to activate a user on the first available router (Home then School)
         /// Used for the "mobile Starlink" scenario where only one router is online at a time
         /// </summary>
-        public string ActivateOnAvailableRouter(string username, int durationHours, string? macAddress = null)
+        public async Task<string> ActivateOnAvailableRouter(string username, int durationHours, string? macAddress = null)
         {
-            _logger.LogInformation("🚀 ActivateOnAvailableRouter START: username={username}, duration={durationHours}h, mac={macAddress}", username, durationHours, macAddress ?? "null");
+            _logger.LogInformation("🚀 ActivateOnAvailableRouter START (PARALLEL MODE): username={username}, duration={durationHours}h, mac={macAddress}", username, durationHours, macAddress ?? "null");
             
             if (string.IsNullOrWhiteSpace(username))
                 throw new ArgumentException("Username is required");
 
-            List<string> errors = new List<string>();
-            string? successfulRouter = null;
-
-            // Try each router in order
+            // Create tasks for each router (parallel attempts)
+            var activationTasks = new List<Task<(string RouterName, string RouterIP, bool Success, string? Error)>>();
             for (int i = 0; i < routerIPs.Length; i++)
             {
-                string routerIP = routerIPs[i];
-                string routerName = routerNames.Length > i ? routerNames[i] : $"Router-{i}";
+                // CRITICAL: Capture in local variables to avoid closure bug
+                // Must capture by value, not reference, so each task gets its own copy
+                string capturedIP = routerIPs[i];
+                string capturedName = routerNames.Length > i ? routerNames[i] : $"Router-{i}";
+                
+                var task = Task.Factory.StartNew(() => AttemptActivateOnRouter(capturedIP, capturedName, username, durationHours, macAddress), TaskCreationOptions.LongRunning);
+                activationTasks.Add(task);
+            }
 
-                _logger.LogInformation("🔄 [{routerName}] Attempting to activate {username}...", routerName, username);
+            var errors = new List<string>();
+            while (activationTasks.Any())
+            {
+                var finishedTask = await Task.WhenAny(activationTasks);
+                activationTasks.Remove(finishedTask);
 
                 try
                 {
-                    using var connection = ConnectToRouter(routerIP);
-                    _logger.LogInformation("✅ [{routerName}] Connected successfully", routerName);
-                    
-                    // Try to activate the user
-                    _logger.LogInformation("   Step 1/2: Creating/updating hotspot user...");
-                    ActivateUserOnConnection(connection, username, durationHours);
-                    _logger.LogInformation("   ✅ Hotspot user ready");
-                    
-                    // If we get here, connection was successful
-                    successfulRouter = routerName;
-                    _logger.LogInformation("✅ [{routerName}] Successfully activated {username}", routerName, username);
-
-                    // If MAC address provided, also bind it
-                    if (!string.IsNullOrWhiteSpace(macAddress))
+                    var result = await finishedTask;
+                    if (result.Success)
                     {
-                        try
+                        _logger.LogInformation("✅ ActivateOnAvailableRouter SUCCESS on {routerName} (PARALLEL)", result.RouterName);
+
+                        if (activationTasks.Any())
                         {
-                            _logger.LogInformation("   Step 2/2: Binding MAC address {macAddress}...", macAddress);
-                            BindMacOnConnection(connection, macAddress, durationHours);
-                            _logger.LogInformation("   ✅ MAC address bound successfully");
+                            _ = Task.WhenAll(activationTasks).ContinueWith(t =>
+                            {
+                                if (t.IsFaulted)
+                                {
+                                    _logger.LogWarning(t.Exception, "⚠️ Some background router activations failed, but the user is already active on one router.");
+                                }
+                            }, TaskContinuationOptions.OnlyOnFaulted);
                         }
-                        catch (Exception macError)
-                        {
-                            _logger.LogWarning("⚠️ MAC binding warning (non-critical): {message}", macError.Message);
-                            // Don't fail activation if MAC binding fails
-                        }
+
+                        return result.RouterName;
                     }
 
-                    _logger.LogInformation("🚀 ActivateOnAvailableRouter SUCCESS on {routerName}", routerName);
-                    return successfulRouter;
+                    if (!string.IsNullOrWhiteSpace(result.Error))
+                        errors.Add(result.Error);
                 }
                 catch (Exception ex)
                 {
-                    string errorMsg = $"{routerName} ({routerIP}): {ex.Message}";
-                    errors.Add(errorMsg);
-                    _logger.LogError(ex, "❌ [{routerName}] Activation failed: {message}", routerName, ex.Message);
-                    // Continue to next router
+                    errors.Add(ex.Message);
+                    _logger.LogWarning(ex, "⚠️ One router failed during activation, checking the next available router.");
                 }
             }
 
-            // If we get here, all routers failed
-            string allErrors = string.Join("; ", errors);
-            _logger.LogError("❌ Failed to activate {username} on any available router. Errors: {errors}", username, allErrors);
-            throw new Exception(
-                $"Failed to activate {username} on any available router. Errors:\n" +
-                string.Join("\n", errors)
-            );
+            string allErrors = errors.Any() ? string.Join("; ", errors) : "No router returned a successful activation.";
+            _logger.LogError("❌ Failed to activate {username} on any available router (parallel). Errors: {errors}", username, allErrors);
+            throw new Exception($"Failed to activate {username} on any available router. Errors:\n{allErrors}");
+        }
+
+        /// <summary>
+        /// Helper method: Attempt to activate on a single router
+        /// </summary>
+        private (string RouterName, string RouterIP, bool Success, string? Error) AttemptActivateOnRouter(
+            string routerIP, string routerName, string username, int durationHours, string? macAddress)
+        {
+            _logger.LogInformation("🔄 [{routerName}] Attempting to activate {username}...", routerName, username);
+
+            try
+            {
+                using var connection = ConnectToRouter(routerIP);
+                _logger.LogInformation("✅ [{routerName}] Connected successfully", routerName);
+                
+                // Try to activate the user
+                _logger.LogInformation("   Step 1/2: Creating/updating hotspot user on {routerName}...", routerName);
+                ActivateUserOnConnection(connection, username, durationHours);
+                _logger.LogInformation("   ✅ Hotspot user ready on {routerName}", routerName);
+                
+                // If MAC address provided, also bind it
+                if (!string.IsNullOrWhiteSpace(macAddress))
+                {
+                    try
+                    {
+                        _logger.LogInformation("   Step 2/2: Binding MAC address {macAddress} on {routerName}...", macAddress, routerName);
+                        BindMacOnConnection(connection, macAddress, durationHours);
+                        _logger.LogInformation("   ✅ MAC address bound successfully on {routerName}", routerName);
+                    }
+                    catch (Exception macError)
+                    {
+                        _logger.LogWarning("⚠️ MAC binding warning on {routerName} (non-critical): {message}", routerName, macError.Message);
+                        // Don't fail activation if MAC binding fails
+                    }
+                }
+
+                _logger.LogInformation("✅ [{routerName}] Successfully activated {username}", routerName, username);
+                return (routerName, routerIP, true, null);
+            }
+            catch (Exception ex)
+            {
+                string errorMsg = $"{routerName} ({routerIP}): {ex.Message}";
+                _logger.LogError(ex, "❌ [{routerName}] Activation failed: {message}", routerName, ex.Message);
+                return (routerName, routerIP, false, errorMsg);
+            }
         }
 
         /// <summary>
@@ -905,7 +1181,7 @@ namespace MikrotikService.Services
         /// This moves the user from 'Hosts' to 'Active' on the MikroTik hotspot
         /// Used for automatic authentication after payment or web login
         /// </summary>
-        public string SilentLogin(string username, string password, string mac, string ip, int durationHours)
+        public async Task<string> SilentLogin(string username, string password, string mac, string ip, int durationHours)
         {
             Console.WriteLine($"🔐 ===== SILENT LOGIN START =====");
             Console.WriteLine($"🔐 Username: {username}");
@@ -942,7 +1218,7 @@ namespace MikrotikService.Services
                     // 2. FORCE the login session for this specific device
                     // This makes the MikroTik move the user from 'Hosts' to 'Active'
                     Console.WriteLine($"   2️⃣ Forcing login session (user: {username}, mac: {mac}, ip: {ip})...");
-                    MoveHostToActive(username, password, mac, ip);
+                    await MoveHostToActive(username, password, mac, ip);
                     Console.WriteLine($"   ✅ Login session forced successfully by MoveHostToActive");
 
                     // If we get here, login was successful
@@ -971,53 +1247,90 @@ namespace MikrotikService.Services
         }
         public string BindMacOnAvailableRouter(string macAddress, int durationHours = 0)
         {
-            _logger.LogInformation("📌 BindMacOnAvailableRouter START: mac={macAddress}, duration={durationHours}h", macAddress, durationHours);
+            _logger.LogInformation("📌 BindMacOnAvailableRouter START (PARALLEL MODE): mac={macAddress}, duration={durationHours}h", macAddress, durationHours);
             
             if (string.IsNullOrWhiteSpace(macAddress))
                 throw new ArgumentException("MAC address is required");
 
-            List<string> errors = new List<string>();
-
-            // Try each router in order
+            // Create tasks for each router (parallel attempts)
+            var bindingTasks = new List<Task<(string RouterName, string RouterIP, bool Success, string? Error)>>();
+            
             for (int i = 0; i < routerIPs.Length; i++)
             {
                 string routerIP = routerIPs[i];
                 string routerName = routerNames.Length > i ? routerNames[i] : $"Router-{i}";
-
-                try
-                {
-                    _logger.LogInformation("🔄 [{routerName}] Attempting to bind MAC {macAddress}...", routerName, macAddress);
-                    
-                    using var connection = ConnectToRouter(routerIP);
-                    _logger.LogInformation("✅ [{routerName}] Connected successfully", routerName);
-                    
-                    // Try to bind the MAC
-                    BindMacOnConnection(connection, macAddress, durationHours);
-                    
-                    _logger.LogInformation("✅ [{routerName}] Successfully bound MAC {macAddress}", routerName, macAddress);
-                    _logger.LogInformation("📌 BindMacOnAvailableRouter SUCCESS on {routerName}", routerName);
-                    return routerName;
-                }
-                catch (Exception ex)
-                {
-                    string errorMsg = $"{routerName} ({routerIP}): {ex.Message}";
-                    errors.Add(errorMsg);
-                    _logger.LogError(ex, "❌ [{routerName}] MAC binding failed: {message}", routerName, ex.Message);
-                    // Continue to next router
-                }
+                
+                // Create a task for this router that will attempt binding
+                var task = Task.Factory.StartNew(() => AttemptBindMacOnRouter(routerIP, routerName, macAddress, durationHours), TaskCreationOptions.LongRunning);
+                bindingTasks.Add(task);
             }
 
-            // If we get here, all routers failed
-            string allErrors = string.Join("; ", errors);
-            _logger.LogError("❌ Failed to bind MAC {macAddress} on any available router. Errors: {errors}", macAddress, allErrors);
-            throw new Exception(
-                $"Failed to bind MAC {macAddress} on any available router. Errors:\n" +
-                string.Join("\n", errors)
-            );
+            // Try routers in parallel using WhenAny - first one to succeed wins
+            try
+            {
+                var completedTask = Task.WhenAny(bindingTasks.Cast<Task>()).Result;
+                
+                // Find which task completed successfully
+                foreach (var task in bindingTasks)
+                {
+                    if (task.IsCompleted && !task.IsFaulted)
+                    {
+                        var result = task.Result;
+                        if (result.Success)
+                        {
+                            _logger.LogInformation("✅ BindMacOnAvailableRouter SUCCESS on {routerName} (PARALLEL)", result.RouterName);
+                            return result.RouterName;
+                        }
+                    }
+                }
+
+                // If no task succeeded, throw aggregated error
+                var errors = bindingTasks
+                    .Where(t => t.IsCompleted)
+                    .Select(t => t.IsFaulted ? t.Exception?.Message : t.Result.Error)
+                    .Where(e => !string.IsNullOrEmpty(e))
+                    .ToList();
+
+                string allErrors = string.Join("; ", errors);
+                _logger.LogError("❌ Failed to bind MAC {macAddress} on any available router (parallel). Errors: {errors}", macAddress, allErrors);
+                throw new Exception($"Failed to bind MAC {macAddress} on any available router. Errors:\n{allErrors}");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "❌ Parallel MAC binding failed: {message}", ex.Message);
+                throw;
+            }
         }
 
         /// <summary>
-        /// FAILOVER METHOD: Tries to unbind MAC on Available routers (tries both Home and School)
+        /// Helper method: Attempt to bind MAC on a single router
+        /// </summary>
+        private (string RouterName, string RouterIP, bool Success, string? Error) AttemptBindMacOnRouter(
+            string routerIP, string routerName, string macAddress, int durationHours)
+        {
+            _logger.LogInformation("🔄 [{routerName}] Attempting to bind MAC {macAddress}...", routerName, macAddress);
+
+            try
+            {
+                using var connection = ConnectToRouter(routerIP);
+                _logger.LogInformation("✅ [{routerName}] Connected successfully", routerName);
+                
+                // Try to bind the MAC
+                BindMacOnConnection(connection, macAddress, durationHours);
+                
+                _logger.LogInformation("✅ [{routerName}] Successfully bound MAC {macAddress}", routerName, macAddress);
+                return (routerName, routerIP, true, null);
+            }
+            catch (Exception ex)
+            {
+                string errorMsg = $"{routerName} ({routerIP}): {ex.Message}";
+                _logger.LogError(ex, "❌ [{routerName}] MAC binding failed: {message}", routerName, ex.Message);
+                return (routerName, routerIP, false, errorMsg);
+            }
+        }
+
+        /// <summary>
+        /// FAILOVER METHOD: Tries to unbind MAC on Available routers (tries both Home and School) - PARALLEL MODE
         /// Used when session expires - MAC might exist on either router
         /// </summary>
         public void UnbindMacOnAvailableRouters(string macAddress)
@@ -1025,64 +1338,99 @@ namespace MikrotikService.Services
             if (string.IsNullOrWhiteSpace(macAddress))
                 throw new ArgumentException("MAC address is required");
 
-            Console.WriteLine($"🔍 Searching for MAC {macAddress} on available routers...");
-            bool foundOnAnyRouter = false;
+            _logger.LogInformation("🔄 UnbindMacOnAvailableRouters START (PARALLEL MODE): mac={macAddress}", macAddress);
 
-            // Try each router - don't fail if one doesn't have it
+            // Create tasks for each router (parallel attempts)
+            var unbindTasks = new List<Task<(string RouterName, bool Found, bool Success, string? Error)>>();
+            
             for (int i = 0; i < routerIPs.Length; i++)
             {
                 string routerIP = routerIPs[i];
                 string routerName = routerNames.Length > i ? routerNames[i] : $"Router-{i}";
-
-                try
-                {
-                    Console.WriteLine($"🔄 [{routerName}] Searching for MAC binding...");
-                    using var connection = ConnectToRouter(routerIP);
-                    
-                    // Try to find and remove the binding using raw command instead of LoadList
-                    // (LoadList fails due to HotspotIpBinding not having TikEntityAttribute)
-                    var printCmd = connection.CreateCommand("/ip/hotspot/ip-binding/print");
-                    printCmd.AddParameter(".proplist", ".id");
-                    printCmd.AddParameter("?mac-address", macAddress);
-                    
-                    var bindings = SafeExecuteList(printCmd).ToList();
-                    Console.WriteLine($"   Found {bindings.Count} binding(s) for MAC {macAddress}");
-
-                    if (bindings != null && bindings.Count > 0)
-                    {
-                        var bindingId = bindings[0].GetResponseField(".id");
-                        var removeCommand = connection.CreateCommand("/ip/hotspot/ip-binding/remove");
-                        removeCommand.AddParameter(".id", bindingId);
-
-                        try
-                        {
-                            Console.WriteLine($"   Executing REMOVE command for binding (ID: {bindingId})");
-                            removeCommand.ExecuteNonQuery();
-                            Console.WriteLine($"   ✅ Removed MAC binding from {routerName}");
-                            foundOnAnyRouter = true;
-                        }
-                        catch (Exception ex)
-                        {
-                            if (!IsEmptyResponseException(ex))
-                                throw;
-                            Console.WriteLine("   Binding removed with empty response");
-                        }
-                    }
-                    else
-                    {
-                        Console.WriteLine($"   ℹ️ MAC not found on {routerName}");
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"⚠️ [{routerName}] Could not check: {ex.Message}");
-                    // Continue checking other routers
-                }
+                
+                // Create a task for this router that will attempt unbinding
+                var task = Task.Factory.StartNew(() => AttemptUnbindMacOnRouter(routerIP, routerName, macAddress), TaskCreationOptions.LongRunning);
+                unbindTasks.Add(task);
             }
 
-            if (!foundOnAnyRouter)
+            // Try all routers in parallel
+            try
             {
-                Console.WriteLine($"⚠️ MAC {macAddress} not found on any router (may already be removed)");
+                Task.WaitAll(unbindTasks.Cast<Task>().ToArray());
+                
+                // Check if any router found and removed the binding
+                var foundOnAnyRouter = unbindTasks
+                    .Where(t => t.IsCompleted && !t.IsFaulted)
+                    .Any(t => t.Result.Found && t.Result.Success);
+
+                if (!foundOnAnyRouter)
+                {
+                    _logger.LogWarning("ℹ️ MAC {macAddress} not found on any router (may already be removed)", macAddress);
+                }
+                else
+                {
+                    _logger.LogInformation("✅ UnbindMacOnAvailableRouters completed (PARALLEL MODE)");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "❌ Parallel unbind failed: {message}", ex.Message);
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Helper method: Attempt to unbind MAC on a single router
+        /// </summary>
+        private (string RouterName, bool Found, bool Success, string? Error) AttemptUnbindMacOnRouter(
+            string routerIP, string routerName, string macAddress)
+        {
+            _logger.LogInformation("🔄 [{routerName}] Searching for MAC binding...", routerName);
+
+            try
+            {
+                using var connection = ConnectToRouter(routerIP);
+                
+                // Try to find and remove the binding using raw command instead of LoadList
+                // (LoadList fails due to HotspotIpBinding not having TikEntityAttribute)
+                var printCmd = connection.CreateCommand("/ip/hotspot/ip-binding/print");
+                printCmd.AddParameter(".proplist", ".id");
+                printCmd.AddParameter("?mac-address", macAddress);
+                
+                var bindings = SafeExecuteList(printCmd).ToList();
+                _logger.LogInformation("   Found {count} binding(s) for MAC {macAddress} on {routerName}", bindings.Count, macAddress, routerName);
+
+                if (bindings != null && bindings.Count > 0)
+                {
+                    var bindingId = bindings[0].GetResponseField(".id");
+                    var removeCommand = connection.CreateCommand("/ip/hotspot/ip-binding/remove");
+                    removeCommand.AddParameter(".id", bindingId);
+
+                    try
+                    {
+                        _logger.LogInformation("   Executing REMOVE command for binding (ID: {id}) on {routerName}", bindingId, routerName);
+                        removeCommand.ExecuteNonQuery();
+                        _logger.LogInformation("   ✅ Removed MAC binding from {routerName}", routerName);
+                        return (routerName, true, true, null);
+                    }
+                    catch (Exception ex)
+                    {
+                        if (!IsEmptyResponseException(ex))
+                            throw;
+                        _logger.LogInformation("   Binding removed with empty response on {routerName}", routerName);
+                        return (routerName, true, true, null);
+                    }
+                }
+                else
+                {
+                    _logger.LogInformation("   ℹ️ MAC not found on {routerName}", routerName);
+                    return (routerName, false, true, null);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "⚠️ [{routerName}] Could not check: {message}", routerName, ex.Message);
+                return (routerName, false, false, ex.Message);
             }
         }
 
@@ -1171,7 +1519,7 @@ namespace MikrotikService.Services
             _logger.LogInformation("   ⏱️ Using profile: {profile}", profile);
             
             // Ensure the requested profile exists 
-            EnsureProfileExistsOnConnection(connection, profile);
+            // EnsureProfileExistsOnConnection(connection, profile);
             
             // Execute set or add
             if (users.Count > 0)
@@ -1429,3 +1777,4 @@ namespace MikrotikService.Services
         }
     }
 }
+

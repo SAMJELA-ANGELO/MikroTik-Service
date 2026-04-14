@@ -19,11 +19,11 @@ namespace MikrotikService.Controllers
         }
 
         [HttpGet("test-connection")]
-        public IActionResult TestConnection()
+        public async Task<IActionResult> TestConnection()
         {
             try
             {
-                var result = _service.TestConnection();
+                var result = await _service.TestConnection();
                 return Ok(new { message = "MikroTik connection successful", data = result });
             }
             catch (Exception ex)
@@ -33,11 +33,11 @@ namespace MikrotikService.Controllers
         }
 
         [HttpGet("users")]
-        public IActionResult ListUsers()
+        public async Task<IActionResult> ListUsers()
         {
             try
             {
-                var users = _service.ListHotspotUsers();
+                var users = await _service.ListHotspotUsers();
                 return Ok(new { users });
             }
             catch (Exception ex)
@@ -47,11 +47,11 @@ namespace MikrotikService.Controllers
         }
 
         [HttpGet("users/{username}")]
-        public IActionResult GetUserDetails(string username)
+        public async Task<IActionResult> GetUserDetails(string username)
         {
             try
             {
-                var user = _service.GetUserDetails(username);
+                var user = await _service.GetUserDetails(username);
                 if (user == null)
                 {
                     return NotFound(new { message = $"User {username} not found" });
@@ -65,11 +65,11 @@ namespace MikrotikService.Controllers
         }
 
         [HttpGet("active-users")]
-        public IActionResult GetActiveUsers()
+        public async Task<IActionResult> GetActiveUsers()
         {
             try
             {
-                var activeUsers = _service.GetActiveUsers();
+                var activeUsers = await _service.GetActiveUsers();
                 return Ok(new { activeUsers });
             }
             catch (Exception ex)
@@ -79,7 +79,7 @@ namespace MikrotikService.Controllers
         }
 
         [HttpPost("users")]
-        public IActionResult Create([FromBody] CreateUserDto dto)
+        public async Task<IActionResult> Create([FromBody] CreateUserDto dto)
         {
             if (string.IsNullOrWhiteSpace(dto.Username) || string.IsNullOrWhiteSpace(dto.Password))
             {
@@ -88,7 +88,7 @@ namespace MikrotikService.Controllers
 
             try
             {
-                _service.CreateUser(dto.Username, dto.Password);
+                await _service.CreateUser(dto.Username, dto.Password);
                 return Ok(new { message = $"User {dto.Username} created" });
             }
             catch (InvalidOperationException ex)
@@ -102,7 +102,7 @@ namespace MikrotikService.Controllers
         }
 
         [HttpPost("disable")]
-        public IActionResult Disable([FromBody] DisableDto dto)
+        public async Task<IActionResult> Disable([FromBody] DisableDto dto)
         {
             if (dto.Username == null)
             {
@@ -110,7 +110,7 @@ namespace MikrotikService.Controllers
             }
             try
             {
-                _service.DisableUser(dto.Username);
+                await _service.DisableUser(dto.Username);
                 return Ok(new { message = $"User {dto.Username} disabled (account kept)" });
             }
             catch (KeyNotFoundException ex)
@@ -124,7 +124,7 @@ namespace MikrotikService.Controllers
         }
 
         [HttpDelete("delete")]
-        public IActionResult DeleteUser(string username)
+        public async Task<IActionResult> DeleteUser(string username)
         {
             if (string.IsNullOrWhiteSpace(username))
             {
@@ -133,7 +133,7 @@ namespace MikrotikService.Controllers
 
             try
             {
-                _service.DeleteUser(username);
+                await _service.DeleteUser(username);
                 return Ok(new { message = $"User {username} permanently deleted" });
             }
             catch (KeyNotFoundException ex)
@@ -147,7 +147,7 @@ namespace MikrotikService.Controllers
         }
 
         [HttpDelete("users/{username}")]
-        public IActionResult Delete(string username)
+        public async Task<IActionResult> Delete(string username)
         {
             if (string.IsNullOrWhiteSpace(username))
             {
@@ -156,7 +156,7 @@ namespace MikrotikService.Controllers
 
             try
             {
-                _service.DeleteUser(username);
+                await _service.DeleteUser(username);
                 return Ok(new { message = $"User {username} deleted" });
             }
             catch (KeyNotFoundException ex)
@@ -170,7 +170,7 @@ namespace MikrotikService.Controllers
         }
 
         [HttpPost("activate")]
-        public IActionResult Activate([FromBody] ActivateDto dto)
+        public async Task<IActionResult> Activate([FromBody] ActivateDto dto)
         {
             if (dto.Username == null)
             {
@@ -178,7 +178,7 @@ namespace MikrotikService.Controllers
             }
             try
             {
-                _service.ActivateUser(dto.Username, dto.DurationHours);
+                await _service.ActivateUser(dto.Username, dto.DurationHours);
                 return Ok(new { message = $"User {dto.Username} activated for {dto.DurationHours} hours" });
             }
             catch (Exception ex)
@@ -188,7 +188,7 @@ namespace MikrotikService.Controllers
         }
 
         [HttpDelete("deactivate")]
-        public IActionResult Deactivate([FromBody] DeactivateDto dto)
+        public async Task<IActionResult> Deactivate([FromBody] DeactivateDto dto)
         {
             if (dto.Username == null)
             {
@@ -196,7 +196,7 @@ namespace MikrotikService.Controllers
             }
             try
             {
-                _service.DeactivateUser(dto.Username);
+                await _service.DeactivateUser(dto.Username);
                 return Ok(new { message = $"User {dto.Username} deactivated" });
             }
             catch (Exception ex)
@@ -206,7 +206,7 @@ namespace MikrotikService.Controllers
         }
 
         [HttpPost("bind-mac")]
-        public IActionResult BindMac([FromBody] BindMacDto dto)
+        public async Task<IActionResult> BindMac([FromBody] BindMacDto dto)
         {
             if (string.IsNullOrWhiteSpace(dto.MacAddress))
             {
@@ -215,7 +215,7 @@ namespace MikrotikService.Controllers
 
             try
             {
-                _service.BindMacToBypass(dto.MacAddress, dto.DurationHours ?? 0);
+                await _service.BindMacToBypass(dto.MacAddress, dto.DurationHours ?? 0);
                 return Ok(new { message = $"MAC address {dto.MacAddress} bound to bypass list" });
             }
             catch (ArgumentException ex)
@@ -229,7 +229,7 @@ namespace MikrotikService.Controllers
         }
 
         [HttpDelete("unbind-mac")]
-        public IActionResult UnbindMac([FromQuery] string macAddress)
+        public async Task<IActionResult> UnbindMac([FromQuery] string macAddress)
         {
             if (string.IsNullOrWhiteSpace(macAddress))
             {
@@ -238,7 +238,7 @@ namespace MikrotikService.Controllers
 
             try
             {
-                _service.UnbindMac(macAddress);
+                await _service.UnbindMac(macAddress);
                 return Ok(new { message = $"MAC address {macAddress} removed from bypass list" });
             }
             catch (ArgumentException ex)
@@ -255,7 +255,7 @@ namespace MikrotikService.Controllers
         /// FAILOVER ENDPOINT: Tries to activate user on first available router (Home then School)
         /// </summary>
         [HttpPost("activate-failover")]
-        public IActionResult ActivateFailover([FromBody] ActivateDto dto)
+        public async Task<IActionResult> ActivateFailover([FromBody] ActivateDto dto)
         {
             _logger.LogInformation("📥 [ActivateFailover] Endpoint called: username={username}, durationHours={durationHours}, mac={mac}", 
                 dto.Username, dto.DurationHours, dto.MacAddress ?? "null");
@@ -277,7 +277,7 @@ namespace MikrotikService.Controllers
                 }
                 
                 _logger.LogInformation("🚀 [ActivateFailover] Calling service.ActivateOnAvailableRouter...");
-                string useRouter = _service.ActivateOnAvailableRouter(dto.Username, dto.DurationHours, decodedMac);
+                string useRouter = await _service.ActivateOnAvailableRouter(dto.Username, dto.DurationHours, decodedMac);
                 _logger.LogInformation("✅ [ActivateFailover] Success on router: {router}", useRouter);
                 
                 return Ok(new { 
@@ -413,7 +413,7 @@ namespace MikrotikService.Controllers
         /// Used for automatic authentication after payment or web login
         /// </summary>
         [HttpPost("silent-login")]
-        public IActionResult SilentLogin([FromBody] SilentLoginDto dto)
+        public async Task<IActionResult> SilentLogin([FromBody] SilentLoginDto dto)
         {
             _logger.LogInformation("📥 [SilentLogin] Endpoint called: username={username}, mac={mac}, ip={ip}", 
                 dto.Username, dto.MacAddress, dto.IpAddress);
@@ -433,7 +433,7 @@ namespace MikrotikService.Controllers
                     dto.MacAddress, decodedMac);
                 
                 _logger.LogInformation("🔐 [SilentLogin] Calling service.SilentLogin...");
-                string activeRouter = _service.SilentLogin(dto.Username, dto.Password, decodedMac, dto.IpAddress, dto.DurationHours);
+                string activeRouter = await _service.SilentLogin(dto.Username, dto.Password, decodedMac, dto.IpAddress, dto.DurationHours);
                 _logger.LogInformation("✅ [SilentLogin] Success on router: {router}", activeRouter);
                 
                 return Ok(new { 
