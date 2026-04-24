@@ -492,8 +492,8 @@ namespace MikrotikService.Services
                 }
 
                 var setCommand = connection.CreateCommand("/ip/hotspot/user/set");
-                setCommand.AddParameter(".id", user.Id); // MUST be first for /set operations
-                _logger.LogInformation("   🔧 Executing user set with .id={userId}", user.Id);
+                setCommand.AddParameter("id", user.Id); // MUST be first for /set operations
+                _logger.LogInformation("   🔧 Executing user set with id={userId}", user.Id);
                 setCommand.AddParameter("profile", profile);
                 setCommand.AddParameter("limit-uptime", $"{durationHours}h");
                 setCommand.AddParameter("disabled", "no");
@@ -664,7 +664,7 @@ namespace MikrotikService.Services
                     {
                         var user = users.First();
                         var removeCommand = connection.CreateCommand("/ip/hotspot/user/remove");
-                        removeCommand.AddParameter(".id", user.Id);
+                        removeCommand.AddParameter("id", user.Id);
 
                         try
                         {
@@ -789,7 +789,7 @@ namespace MikrotikService.Services
                     }
 
                     var removeCommand = connection.CreateCommand("/ip/hotspot/user/remove");
-                    removeCommand.AddParameter(".id", user.Id);
+                    removeCommand.AddParameter("id", user.Id);
                     SafeExecuteList(removeCommand);
 
                     _logger.LogInformation("✅ [{routerName}] User {username} deleted successfully", routerName, username);
@@ -837,7 +837,7 @@ namespace MikrotikService.Services
                     }
 
                     var setCommand = connection.CreateCommand("/ip/hotspot/user/set");
-                    setCommand.AddParameter(".id", user.Id);
+                    setCommand.AddParameter("id", user.Id);
                     setCommand.AddParameter("password", newPassword);
                     SafeExecuteList(setCommand);
 
@@ -892,8 +892,8 @@ namespace MikrotikService.Services
                     }
 
                     var setCommand = connection.CreateCommand("/ip/hotspot/user/set");
-                    setCommand.AddParameter(".id", user.Id); // MUST be first for /set operations
-                    _logger.LogInformation("   🔧 Executing disable set with .id={userId}", user.Id);
+                    setCommand.AddParameter("id", user.Id); // MUST be first for /set operations
+                    _logger.LogInformation("   🔧 Executing disable set with id={userId}", user.Id);
                     setCommand.AddParameter("disabled", "yes");
 
                     try
@@ -1080,7 +1080,7 @@ namespace MikrotikService.Services
                     if (existingBindings != null && existingBindings.Count > 0)
                     {
                         var bindingCommand = connection.CreateCommand("/ip/hotspot/ip-binding/remove");
-                        bindingCommand.AddParameter(".id", existingBindings[0].Id);
+                        bindingCommand.AddParameter("id", existingBindings[0].Id);
                         try
                         {
                             bindingCommand.ExecuteNonQuery();
@@ -1150,7 +1150,7 @@ namespace MikrotikService.Services
                     if (bindings != null && bindings.Count > 0)
                     {
                         var removeCommand = connection.CreateCommand("/ip/hotspot/ip-binding/remove");
-                        removeCommand.AddParameter(".id", bindings[0].Id);
+                        removeCommand.AddParameter("id", bindings[0].Id);
 
                         try
                         {
@@ -1460,7 +1460,7 @@ namespace MikrotikService.Services
                     {
                         var bindingId = bindings[0].GetResponseField(".id");
                         var removeCommand = connection.CreateCommand("/ip/hotspot/ip-binding/remove");
-                        removeCommand.AddParameter(".id", bindingId);
+                        removeCommand.AddParameter("id", bindingId);
 
                         try
                         {
@@ -1526,7 +1526,7 @@ namespace MikrotikService.Services
                         _logger.LogInformation("   🗑️ Found active session ID {sessionId} for {username}, disconnecting...", sessionId, username);
                         
                         var removeCmd = connection.CreateCommand("/ip/hotspot/active/remove");
-                        removeCmd.AddParameter(".id", sessionId);
+                        removeCmd.AddParameter("id", sessionId);
                         SafeExecuteList(removeCmd);
                         
                         _logger.LogInformation("   ✅ Active session {sessionId} removed for {username}", sessionId, username);
@@ -1615,8 +1615,8 @@ namespace MikrotikService.Services
                 }
 
                 var setCommand = connection.CreateCommand("/ip/hotspot/user/set");
-                // Use .id parameter for set command (required by MikroTik API)
-                setCommand.AddParameter(".id", user.Id);
+                // Use id parameter for set command (required by tik4net API)
+                setCommand.AddParameter("id", user.Id);
                 setCommand.AddParameter("profile", profile);
                 setCommand.AddParameter("limit-uptime", $"{durationHours}h");
                 setCommand.AddParameter("disabled", "no");
@@ -1693,7 +1693,7 @@ namespace MikrotikService.Services
                     var bindingId = results[0].GetResponseField(".id");
                     Console.WriteLine($"   🗑️ Removing old binding (ID: {bindingId})...");
                     var removeCommand = connection.CreateCommand("/ip/hotspot/ip-binding/remove");
-                    removeCommand.AddParameter(".id", bindingId);
+                    removeCommand.AddParameter("id", bindingId);
                     Console.WriteLine("   ⚙️ Executing REMOVE command for old binding");
                     SafeExecuteList(removeCommand);
                     Console.WriteLine("   ✅ Old binding removed successfully");
