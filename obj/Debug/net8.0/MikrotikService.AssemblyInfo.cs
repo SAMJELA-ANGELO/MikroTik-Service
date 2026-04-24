@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("MikrotikService")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+3389e29e22103b861c317129f1cae8fdf7883abf")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+acea2c45a02df842cd0453705a4fe55049c08b29")]
 [assembly: System.Reflection.AssemblyProductAttribute("MikrotikService")]
 [assembly: System.Reflection.AssemblyTitleAttribute("MikrotikService")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

@@ -17,7 +17,29 @@ builder.Services.AddSwaggerGen();
 builder.Services.AddControllers();
 builder.Services.AddSingleton<MikrotikService.Services.MikrotikService>();
 
+// Enable CORS for frontend integration
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("AllowFrontend", policy =>
+    {
+        policy.WithOrigins(
+            "http://localhost:3000",
+            "http://localhost:3001",
+            "http://localhost:3002",
+            "https://splendidstarlink.netlify.app",
+            "https://splendid-starlink-frontend.onrender.com",
+            "https://splendid-starlink.vercel.app"
+        )
+        .AllowAnyMethod()
+        .AllowAnyHeader()
+        .AllowCredentials();
+    });
+});
+
 var app = builder.Build();
+
+// Apply CORS middleware BEFORE routing
+app.UseCors("AllowFrontend");
 
 // ENABLE SWAGGER FOR ALL ENVIRONMENTS (Production & Development)
 app.UseSwagger();

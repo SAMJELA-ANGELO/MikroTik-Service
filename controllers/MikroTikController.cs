@@ -79,7 +79,7 @@ namespace MikrotikService.Controllers
         }
 
         [HttpPost("users")]
-        public IActionResult Create([FromBody] CreateUserDto dto)
+        public async Task<IActionResult> Create([FromBody] CreateUserDto dto)
         {
             if (string.IsNullOrWhiteSpace(dto.Username) || string.IsNullOrWhiteSpace(dto.Password))
             {
@@ -88,7 +88,7 @@ namespace MikrotikService.Controllers
 
             try
             {
-                _service.CreateUser(dto.Username, dto.Password);
+                await _service.CreateUser(dto.Username, dto.Password).ConfigureAwait(false);
                 return Ok(new { message = $"User {dto.Username} created" });
             }
             catch (InvalidOperationException ex)
@@ -98,6 +98,25 @@ namespace MikrotikService.Controllers
             catch (Exception ex)
             {
                 return StatusCode(500, new { message = "Failed to create user", error = ex.Message });
+            }
+        }
+
+        [HttpPut("users/password")]
+        public async Task<IActionResult> UpdatePassword([FromBody] UpdatePasswordDto dto)
+        {
+            if (string.IsNullOrWhiteSpace(dto.Username) || string.IsNullOrWhiteSpace(dto.NewPassword))
+            {
+                return BadRequest(new { message = "Username and new password are required" });
+            }
+
+            try
+            {
+                await _service.UpdateUserPassword(dto.Username, dto.NewPassword).ConfigureAwait(false);
+                return Ok(new { message = $"Password updated for user {dto.Username}" });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { message = "Failed to update password", error = ex.Message });
             }
         }
 
@@ -170,16 +189,22 @@ namespace MikrotikService.Controllers
         }
 
         [HttpPost("activate")]
-        public IActionResult Activate([FromBody] ActivateDto dto)
+        public async Task<IActionResult> Activate([FromBody] ActivateDto dto)
         {
-            if (dto.Username == null)
+            if (string.IsNullOrWhiteSpace(dto.Username))
             {
                 return BadRequest("Username is required");
             }
+
+            if (dto.DurationHours <= 0)
+            {
+                return BadRequest(new { message = "DurationHours must be greater than zero" });
+            }
+
             try
             {
-                _service.ActivateUser(dto.Username, dto.DurationHours);
-                return Ok(new { message = $"User {dto.Username} activated for {dto.DurationHours} hours" });
+                var activeRouter = await _service.ActivateUser(dto.Username, dto.DurationHours).ConfigureAwait(false);
+                return Ok(new { message = $"User {dto.Username} activated for {dto.DurationHours} hours", activeRouter });
             }
             catch (Exception ex)
             {
@@ -255,7 +280,7 @@ namespace MikrotikService.Controllers
         /// FAILOVER ENDPOINT: Tries to activate user on first available router (Home then School)
         /// </summary>
         [HttpPost("activate-failover")]
-        public IActionResult ActivateFailover([FromBody] ActivateDto dto)
+        public async Task<IActionResult> ActivateFailover([FromBody] ActivateDto dto)
         {
             _logger.LogInformation("📥 [ActivateFailover] Endpoint called: username={username}, durationHours={durationHours}, mac={mac}", 
                 dto.Username, dto.DurationHours, dto.MacAddress ?? "null");
@@ -264,6 +289,12 @@ namespace MikrotikService.Controllers
             {
                 _logger.LogWarning("⚠️ [ActivateFailover] Missing username");
                 return BadRequest(new { message = "Username is required" });
+            }
+
+            if (dto.DurationHours <= 0)
+            {
+                _logger.LogWarning("⚠️ [ActivateFailover] Invalid DurationHours: {durationHours}", dto.DurationHours);
+                return BadRequest(new { message = "DurationHours must be greater than zero" });
             }
 
             try
@@ -277,7 +308,7 @@ namespace MikrotikService.Controllers
                 }
                 
                 _logger.LogInformation("🚀 [ActivateFailover] Calling service.ActivateOnAvailableRouter...");
-                string useRouter = _service.ActivateOnAvailableRouter(dto.Username, dto.DurationHours, decodedMac);
+                string useRouter = await _service.ActivateOnAvailableRouter(dto.Username, dto.DurationHours, decodedMac).ConfigureAwait(false);
                 _logger.LogInformation("✅ [ActivateFailover] Success on router: {router}", useRouter);
                 
                 return Ok(new { 
@@ -302,7 +333,7 @@ namespace MikrotikService.Controllers
         /// Recipient will log in manually; MAC will be captured on first login
         /// </summary>
         [HttpPost("create-hotspot-user")]
-        public IActionResult CreateHotspotUserOnly([FromBody] CreateHotspotUserDto dto)
+        public async Task<IActionResult> CreateHotspotUserOnly([FromBody] CreateHotspotUserDto dto)
         {
             _logger.LogInformation("📥 [CreateHotspotUserOnly] Endpoint called: username={username}, durationHours={durationHours}", 
                 dto.Username, dto.DurationHours);
@@ -313,10 +344,16 @@ namespace MikrotikService.Controllers
                 return BadRequest(new { message = "Username is required" });
             }
 
+            if (dto.DurationHours <= 0)
+            {
+                _logger.LogWarning("⚠️ [CreateHotspotUserOnly] Invalid DurationHours: {durationHours}", dto.DurationHours);
+                return BadRequest(new { message = "DurationHours must be greater than zero" });
+            }
+
             try
             {
                 _logger.LogInformation("🎁 [CreateHotspotUserOnly] Calling service.CreateHotspotUserOnly...");
-                string activeRouter = _service.CreateHotspotUserOnly(dto.Username, dto.DurationHours);
+                string activeRouter = await _service.CreateHotspotUserOnly(dto.Username, dto.DurationHours).ConfigureAwait(false);
                 _logger.LogInformation("✅ [CreateHotspotUserOnly] Success on router: {router}", activeRouter);
                 
                 return Ok(new { 
@@ -413,7 +450,7 @@ namespace MikrotikService.Controllers
         /// Used for automatic authentication after payment or web login
         /// </summary>
         [HttpPost("silent-login")]
-        public IActionResult SilentLogin([FromBody] SilentLoginDto dto)
+        public async Task<IActionResult> SilentLogin([FromBody] SilentLoginDto dto)
         {
             _logger.LogInformation("📥 [SilentLogin] Endpoint called: username={username}, mac={mac}, ip={ip}", 
                 dto.Username, dto.MacAddress, dto.IpAddress);
@@ -425,6 +462,12 @@ namespace MikrotikService.Controllers
                 return BadRequest(new { message = "Username, password, MAC address, and IP address are required" });
             }
 
+            if (dto.DurationHours <= 0)
+            {
+                _logger.LogWarning("⚠️ [SilentLogin] Invalid DurationHours: {durationHours}", dto.DurationHours);
+                return BadRequest(new { message = "DurationHours must be greater than zero" });
+            }
+
             try
             {
                 // FIX: Decode the MAC address - it may arrive URL-encoded (02%3A38... instead of 02:38...)
@@ -433,7 +476,7 @@ namespace MikrotikService.Controllers
                     dto.MacAddress, decodedMac);
                 
                 _logger.LogInformation("🔐 [SilentLogin] Calling service.SilentLogin...");
-                string activeRouter = _service.SilentLogin(dto.Username, dto.Password, decodedMac, dto.IpAddress, dto.DurationHours);
+                string activeRouter = await _service.SilentLogin(dto.Username, dto.Password, decodedMac, dto.IpAddress, dto.DurationHours).ConfigureAwait(false);
                 _logger.LogInformation("✅ [SilentLogin] Success on router: {router}", activeRouter);
                 
                 return Ok(new { 
@@ -498,5 +541,11 @@ namespace MikrotikService.Controllers
         public string? MacAddress { get; set; }
         public string? IpAddress { get; set; }
         public int DurationHours { get; set; }
+    }
+
+    public class UpdatePasswordDto
+    {
+        public string? Username { get; set; }
+        public string? NewPassword { get; set; }
     }
 }

@@ -3,7 +3,10 @@ using tik4net.Api;
 using tik4net.Objects;
 using tik4net.Objects.Ip.Hotspot;
 using tik4net.Objects.System;
+using System;
 using System.Linq;
+using System.Reflection;
+using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 
 namespace MikrotikService.Services
@@ -16,7 +19,18 @@ namespace MikrotikService.Services
         // Multi-router support (for failover)
         private readonly string[] routerIPs = new[] { "10.0.0.3", "10.0.0.2" }; // School: 10.0.0.3, Home: 10.0.0.2
         private readonly string[] routerNames = new[] { "School", "Home" }; // Router names for logging
+
+        // Connection pool - keeps connections alive and reuses them
+        private static readonly Dictionary<string, ITikConnection> ConnectionPool = new();
+        private static readonly ReaderWriterLockSlim ConnectionPoolLock = new();
         
+        private static string? _activeRouterIp = null;
+        private static DateTime _lastDiscoveryTime = DateTime.MinValue;
+        private static readonly TimeSpan CacheDuration = TimeSpan.FromHours(1);
+        private static readonly TimeSpan DefaultConnectionTimeout = TimeSpan.FromSeconds(3);
+        private static readonly SemaphoreSlim _routerDiscoveryLock = new SemaphoreSlim(1, 1);
+        private static readonly object _cacheLock = new object();
+
         private readonly ILogger<MikrotikService> _logger;
 
         public MikrotikService(ILogger<MikrotikService> logger)
@@ -25,40 +39,316 @@ namespace MikrotikService.Services
             _logger.LogInformation("🔧 MikrotikService initialized");
         }
 
-        private ITikConnection Connect(string ipAddress)
+        /// <summary>
+        /// Get or create a cached connection for the given router IP
+        /// </summary>
+        private ITikConnection GetOrCreateConnection(string ipAddress)
         {
-            _logger.LogInformation("📡 Attempting to connect to MikroTik: {ip}", ipAddress);
+            ConnectionPoolLock.EnterReadLock();
             try
             {
-                var connection = ConnectionFactory.CreateConnection(TikConnectionType.Api);
-                connection.Open(ipAddress, user, pass);
-                _logger.LogInformation("✅ Connected to MikroTik {ip} successfully", ipAddress);
-                return connection;
+                if (ConnectionPool.TryGetValue(ipAddress, out var cachedConnection))
+                {
+                    try
+                    {
+                        // Test if connection is still alive by checking if it's connected
+                        if (cachedConnection != null && IsConnectionAlive(cachedConnection))
+                        {
+                            _logger.LogInformation("♻️ Reusing cached connection to {ip}", ipAddress);
+                            return cachedConnection;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "⚠️ Cached connection to {ip} is dead, will recreate", ipAddress);
+                    }
+                }
             }
-            catch (Exception ex)
+            finally
             {
-                _logger.LogError(ex, "❌ Failed to connect to MikroTik {ip}: {message}", ipAddress, ex.Message);
-                throw;
+                ConnectionPoolLock.ExitReadLock();
+            }
+
+            // Connection not found or dead, create new one
+            ConnectionPoolLock.EnterWriteLock();
+            try
+            {
+                // Double-check pattern - another thread might have created it
+                if (ConnectionPool.TryGetValue(ipAddress, out var cachedConnection) && 
+                    IsConnectionAlive(cachedConnection))
+                {
+                    return cachedConnection;
+                }
+
+                _logger.LogInformation("🆕 Creating new connection to {ip}", ipAddress);
+                var newConnection = Connect(ipAddress);
+                ConnectionPool[ipAddress] = newConnection;
+                return newConnection;
+            }
+            finally
+            {
+                ConnectionPoolLock.ExitWriteLock();
             }
         }
 
         /// <summary>
-        /// Connect to a specific router by IP address
+        /// Check if a connection is still alive
         /// </summary>
-        private ITikConnection ConnectToRouter(string routerIP)
+        private bool IsConnectionAlive(ITikConnection connection)
         {
-            _logger.LogInformation("📡 Attempting to connect to router IP: {routerIP}", routerIP);
             try
             {
-                var connection = ConnectionFactory.CreateConnection(TikConnectionType.Api);
-                connection.Open(routerIP, user, pass);
-                _logger.LogInformation("✅ Connected to router {routerIP} successfully", routerIP);
-                return connection;
+                // Try to execute a simple command to check if connection is alive
+                var testCmd = connection.CreateCommand("/system/identity/print");
+                testCmd.ExecuteList().FirstOrDefault();
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Remove a connection from the pool (when it fails)
+        /// </summary>
+        private void RemoveConnectionFromPool(string ipAddress)
+        {
+            ConnectionPoolLock.EnterWriteLock();
+            try
+            {
+                if (ConnectionPool.TryGetValue(ipAddress, out var conn))
+                {
+                    try
+                    {
+                        conn?.Dispose();
+                    }
+                    catch { }
+                    ConnectionPool.Remove(ipAddress);
+                    _logger.LogInformation("🗑️ Removed dead connection from pool: {ip}", ipAddress);
+                }
+            }
+            finally
+            {
+                ConnectionPoolLock.ExitWriteLock();
+            }
+        }
+
+        private ITikConnection Connect(string ipAddress)
+        {
+            _logger.LogInformation("📡 Attempting to connect to MikroTik: {ip} with enforced timeout {timeoutSeconds}s", ipAddress, DefaultConnectionTimeout.TotalSeconds);
+            var connection = ConnectionFactory.CreateConnection(TikConnectionType.Api);
+            TrySetConnectionTimeout(connection, DefaultConnectionTimeout);
+
+            var connectTask = Task.Run(() => connection.Open(ipAddress, user, pass));
+            if (!connectTask.Wait(DefaultConnectionTimeout))
+            {
+                try
+                {
+                    connection.Dispose();
+                }
+                catch
+                {
+                }
+
+                var timeoutMessage = $"Connection to {ipAddress} timed out after {DefaultConnectionTimeout.TotalSeconds} seconds.";
+                _logger.LogError(timeoutMessage);
+                throw new TimeoutException(timeoutMessage);
+            }
+
+            if (connectTask.IsFaulted)
+            {
+                var ex = connectTask.Exception?.GetBaseException() ?? new Exception("Connection failed during attempt.");
+                _logger.LogError(ex, "❌ Failed to connect to MikroTik {ip}: {message}", ipAddress, ex.Message);
+                throw ex;
+            }
+
+            _logger.LogInformation("✅ Connected to MikroTik {ip} successfully", ipAddress);
+            return connection;
+        }
+
+        private void TrySetConnectionTimeout(ITikConnection connection, TimeSpan timeout)
+        {
+            if (connection == null)
+                return;
+
+            try
+            {
+                var connectionType = connection.GetType();
+                var timeoutMs = (int)timeout.TotalMilliseconds;
+                var timeoutProperty = connectionType.GetProperty("Timeout")
+                                      ?? connectionType.GetProperty("ReadTimeout")
+                                      ?? connectionType.GetProperty("WriteTimeout");
+
+                if (timeoutProperty != null && timeoutProperty.CanWrite)
+                {
+                    if (timeoutProperty.PropertyType == typeof(int))
+                    {
+                        timeoutProperty.SetValue(connection, timeoutMs);
+                        _logger.LogInformation("⏱️ Set tik4net timeout to {timeoutMs}ms", timeoutMs);
+                    }
+                    else if (timeoutProperty.PropertyType == typeof(TimeSpan))
+                    {
+                        timeoutProperty.SetValue(connection, timeout);
+                        _logger.LogInformation("⏱️ Set tik4net timeout to {timeout}", timeout);
+                    }
+                }
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "❌ Failed to connect to router {routerIP}: {message}", routerIP, ex.Message);
-                throw;
+                _logger.LogWarning(ex, "⚠️ Unable to set connection timeout on tik4net connection");
+            }
+        }
+
+        private void OpenConnectionWithTimeout(ITikConnection connection, string host, string username, string password, TimeSpan timeout)
+        {
+            if (connection == null)
+                throw new ArgumentNullException(nameof(connection));
+
+            TrySetConnectionTimeout(connection, timeout);
+            var connectionType = connection.GetType();
+            var openMethods = connectionType.GetMethods(BindingFlags.Instance | BindingFlags.Public)
+                .Where(m => m.Name == "Open" && m.GetParameters().Length == 4)
+                .ToList();
+
+            foreach (var method in openMethods)
+            {
+                var parameters = method.GetParameters();
+                if (parameters[0].ParameterType != typeof(string) ||
+                    parameters[1].ParameterType != typeof(string) ||
+                    parameters[2].ParameterType != typeof(string))
+                {
+                    continue;
+                }
+
+                var timeoutParamType = parameters[3].ParameterType;
+                object timeoutValue;
+                if (timeoutParamType == typeof(TimeSpan))
+                {
+                    timeoutValue = timeout;
+                }
+                else if (timeoutParamType == typeof(int) || timeoutParamType == typeof(long) ||
+                         timeoutParamType == typeof(uint) || timeoutParamType == typeof(ushort) ||
+                         timeoutParamType == typeof(short))
+                {
+                    timeoutValue = (int)timeout.TotalMilliseconds;
+                }
+                else if (timeoutParamType == typeof(double) || timeoutParamType == typeof(float))
+                {
+                    timeoutValue = timeout.TotalSeconds;
+                }
+                else
+                {
+                    continue;
+                }
+
+                try
+                {
+                    method.Invoke(connection, new object[] { host, username, password, timeoutValue });
+                    _logger.LogInformation("⏱️ Opened connection to {host} using explicit timeout overload", host);
+                    return;
+                }
+                catch (TargetInvocationException tie)
+                {
+                    throw tie.InnerException ?? tie;
+                }
+            }
+
+            OpenConnectionWithTaskTimeout(connection, host, username, password, timeout);
+        }
+
+        private void OpenConnectionWithTaskTimeout(ITikConnection connection, string host, string username, string password, TimeSpan timeout)
+        {
+            var connectTask = Task.Run(() =>
+            {
+                connection.Open(host, username, password);
+                return connection;
+            });
+
+            if (!connectTask.Wait(timeout))
+            {
+                try
+                {
+                    connection.Dispose();
+                }
+                catch { }
+
+                throw new TimeoutException($"Connection to {host} timed out after {timeout.TotalSeconds} seconds.");
+            }
+
+            if (connectTask.IsFaulted)
+            {
+                throw connectTask.Exception?.GetBaseException() ?? new Exception("Connection failed during attempt.");
+            }
+        }
+
+        private IEnumerable<(string routerIP, string routerName)> GetRouterAttemptOrder()
+        {
+            var attemptedIps = new HashSet<string>();
+            string? activeRouterIp;
+            DateTime lastDiscoveryTime;
+
+            lock (_cacheLock)
+            {
+                activeRouterIp = _activeRouterIp;
+                lastDiscoveryTime = _lastDiscoveryTime;
+            }
+
+            if (!string.IsNullOrWhiteSpace(activeRouterIp) && (DateTime.UtcNow - lastDiscoveryTime) < CacheDuration)
+            {
+                attemptedIps.Add(activeRouterIp);
+                yield return (activeRouterIp, GetRouterName(activeRouterIp));
+            }
+
+            for (int i = 0; i < routerIPs.Length; i++)
+            {
+                if (attemptedIps.Contains(routerIPs[i]))
+                    continue;
+
+                yield return (routerIPs[i], routerNames.Length > i ? routerNames[i] : $"Router-{i}");
+            }
+        }
+
+        private string GetRouterName(string ipAddress)
+        {
+            for (int i = 0; i < routerIPs.Length; i++)
+            {
+                if (routerIPs[i] == ipAddress)
+                    return routerNames.Length > i ? routerNames[i] : $"Router-{i}";
+            }
+            return ipAddress;
+        }
+
+        private bool TryGetCachedRouter(out string? routerIP)
+        {
+            lock (_cacheLock)
+            {
+                if (!string.IsNullOrWhiteSpace(_activeRouterIp) && (DateTime.UtcNow - _lastDiscoveryTime) < CacheDuration)
+                {
+                    routerIP = _activeRouterIp;
+                    return true;
+                }
+
+                routerIP = null;
+                return false;
+            }
+        }
+
+        private void SetActiveRouter(string routerIP)
+        {
+            lock (_cacheLock)
+            {
+                _activeRouterIp = routerIP;
+                _lastDiscoveryTime = DateTime.UtcNow;
+            }
+        }
+
+        private void ClearActiveRouterCache()
+        {
+            lock (_cacheLock)
+            {
+                _activeRouterIp = null;
+                _lastDiscoveryTime = DateTime.MinValue;
             }
         }
 
@@ -91,101 +381,163 @@ namespace MikrotikService.Services
             }
         }
 
-        public void ActivateUser(string username, int durationHours)
+        public async Task<string> ActivateUser(string username, int durationHours)
         {
             if (string.IsNullOrWhiteSpace(username))
                 throw new ArgumentException("Username is required");
 
-            // Use failover logic - try each router until one works
-            for (int i = 0; i < routerIPs.Length; i++)
+            if (TryGetCachedRouter(out var cachedRouterIp))
             {
-                string routerIP = routerIPs[i];
-                string routerName = routerNames.Length > i ? routerNames[i] : $"Router-{i}";
-
                 try
                 {
-                    _logger.LogInformation("🔄 [{routerName}] Attempting to activate user {username}...", routerName, username);
-                    using var connection = Connect(routerIP);
-
-                    List<HotspotUser> users;
-                    try
-                    {
-                        users = connection.LoadList<HotspotUser>(connection.CreateParameter("name", username)).ToList();
-                    }
-                    catch (Exception ex)
-                    {
-                        if (IsEmptyResponseException(ex))
-                        {
-                            users = new List<HotspotUser>();
-                        }
-                        else
-                            throw;
-                    }
-
-                    var profile = $"profile-{durationHours}h";
-
-                    // Ensure the requested profile exists on the device before assigning it.
-                    EnsureProfileExistsOnConnection(connection, profile);
-
-                    if (!HotspotProfileExists(connection, profile))
-                    {
-                        _logger.LogError("❌ [{routerName}] Profile {profile} was not found after creation", routerName, profile);
-                        throw new InvalidOperationException($"Hotspot profile '{profile}' could not be verified on router {routerIP}.");
-                    }
-
-                    if (users.Count == 0)
-                    {
-                        _logger.LogWarning("⚠️ [{routerName}] User {username} not found, trying next router...", routerName, username);
-                        continue; // Try next router
-                    }
-
-                    var user = users.First();
-
-                    var setCommand = connection.CreateCommand("/ip/hotspot/user/set");
-                    setCommand.AddParameter(".id", user.Id);
-                    setCommand.AddParameter("profile", profile);
-                    setCommand.AddParameter("limit-uptime", $"{durationHours}h");
-                    setCommand.AddParameter("disabled", "no");
-
-                    try
-                    {
-                        setCommand.ExecuteNonQuery();
-                        _logger.LogInformation("✅ [{routerName}] User {username} activated with {hours}h access", routerName, username, durationHours);
-                    }
-                    catch (Exception ex)
-                    {
-                        if (!IsEmptyResponseException(ex))
-                            throw;
-                        // else continue to verification
-                    }
-
-                    // Verification: ensure the user now exists on the device
-                    try
-                    {
-                        var verified = connection.LoadList<HotspotUser>(connection.CreateParameter("name", username)).FirstOrDefault();
-                        if (verified != null)
-                        {
-                            _logger.LogInformation("✅ [{routerName}] Activation verified for {username}", routerName, username);
-                            return; // Success - exit the method
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        if (!IsEmptyResponseException(ex))
-                            throw;
-                    }
-
-                    _logger.LogWarning("⚠️ [{routerName}] Activation verification failed, trying next router...", routerName);
+                    _logger.LogInformation("🔄 [Sticky] Trying cached router {routerIP} first for user {username}", cachedRouterIp, username);
+                    _logger.LogInformation("✅ [Sticky] Fast path hit: using cached router {routerIP} for user {username}", cachedRouterIp, username);
+                    return await ActivateUserOnRouter(cachedRouterIp!, username, durationHours).ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "❌ [{routerName}] Activation failed: {message}", routerName, ex.Message);
-                    // Continue to next router
+                    _logger.LogWarning(ex, "⚠️ Cached router {routerIP} failed, clearing sticky cache and falling back", cachedRouterIp);
+                    ClearActiveRouterCache();
                 }
             }
 
-            // If we get here, all routers failed
-            throw new Exception($"Failed to activate user '{username}' on any available router.");
+            await _routerDiscoveryLock.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                if (TryGetCachedRouter(out cachedRouterIp))
+                {
+                    try
+                    {
+                        _logger.LogInformation("🔄 [Sticky] Re-checking cached router {routerIP} before failover for user {username}", cachedRouterIp, username);
+                        return await ActivateUserOnRouter(cachedRouterIp!, username, durationHours).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "⚠️ Cached router {routerIP} failed on re-check, clearing sticky cache and continuing failover", cachedRouterIp);
+                        ClearActiveRouterCache();
+                    }
+                }
+
+                for (int i = 0; i < routerIPs.Length; i++)
+                {
+                    string routerIP = routerIPs[i];
+                    string routerName = routerNames.Length > i ? routerNames[i] : $"Router-{i}";
+
+                    try
+                    {
+                        _logger.LogInformation("🔄 [{routerName}] Attempting to activate user {username}...", routerName, username);
+                        return await ActivateUserOnRouter(routerIP, username, durationHours).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "❌ [{routerName}] Activation failed: {message}", routerName, ex.Message);
+                        // Continue to next router
+                    }
+                }
+
+                throw new Exception($"Failed to activate user '{username}' on any available router.");
+            }
+            finally
+            {
+                _routerDiscoveryLock.Release();
+            }
+        }
+
+        private async Task<string> ActivateUserOnRouter(string routerIP, string username, int durationHours)
+        {
+            string routerName = GetRouterName(routerIP);
+            _logger.LogInformation("🔄 [{routerName}] Activating user {username} on router {routerIP}...", routerName, username, routerIP);
+
+            ITikConnection connection = GetOrCreateConnection(routerIP);
+            try
+            {
+                List<HotspotUser> users;
+                try
+                {
+                    users = connection.LoadList<HotspotUser>(connection.CreateParameter("name", username)).ToList();
+                }
+                catch (Exception ex)
+                {
+                    if (IsEmptyResponseException(ex))
+                    {
+                        users = new List<HotspotUser>();
+                    }
+                    else
+                        throw;
+                }
+
+                var profile = $"profile-{durationHours}h";
+
+                // Ensure the requested profile exists on the device before assigning it.
+                await EnsureProfileExistsOnConnectionAsync(connection, profile).ConfigureAwait(false);
+
+                if (!HotspotProfileExists(connection, profile))
+                {
+                    _logger.LogError("❌ [{routerName}] Profile {profile} was not found after creation", routerName, profile);
+                    throw new InvalidOperationException($"Hotspot profile '{profile}' could not be verified on router {routerIP}.");
+                }
+
+                if (users.Count == 0)
+                {
+                    _logger.LogWarning("⚠️ [{routerName}] User {username} not found", routerName, username);
+                    throw new InvalidOperationException($"User '{username}' not found on router {routerIP}.");
+                }
+
+                var user = users.First();
+                _logger.LogInformation("🔍 [{routerName}] Found user {username} with ID: '{userId}'", routerName, username, user.Id ?? "null");
+                if (string.IsNullOrWhiteSpace(user.Id))
+                {
+                    _logger.LogError("❌ [{routerName}] Cannot activate user {username}: missing MikroTik internal .id", routerName, username);
+                    throw new InvalidOperationException($"Hotspot user '{username}' has no internal .id on router {routerName}.");
+                }
+
+                var setCommand = connection.CreateCommand("/ip/hotspot/user/set");
+                setCommand.AddParameter(".id", user.Id); // MUST be first for /set operations
+                _logger.LogInformation("   🔧 Executing user set with .id={userId}", user.Id);
+                setCommand.AddParameter("profile", profile);
+                setCommand.AddParameter("limit-uptime", $"{durationHours}h");
+                setCommand.AddParameter("disabled", "no");
+
+                try
+                {
+                    setCommand.ExecuteList();
+                    _logger.LogInformation("✅ [{routerName}] User {username} activated with {hours}h access", routerName, username, durationHours);
+                }
+                catch (Exception ex)
+                {
+                    if (!IsEmptyResponseException(ex))
+                        throw;
+                    _logger.LogInformation("ℹ️ [{routerName}] SET command returned empty response for {username}", routerName, username);
+                }
+
+                // Verification: ensure the user now exists on the device
+                try
+                {
+                    var verified = connection.LoadList<HotspotUser>(connection.CreateParameter("name", username)).FirstOrDefault();
+                    if (verified == null)
+                    {
+                        _logger.LogError("❌ [{routerName}] Activation verification failed: user '{username}' not found after operation", routerName, username);
+                        throw new InvalidOperationException($"Failed to verify activation for user '{username}' on router {routerIP}.");
+                    }
+
+                    SetActiveRouter(routerIP);
+                    _logger.LogInformation("✅ [{routerName}] Activation verified for {username}", routerName, username);
+                    return routerName;
+                }
+                catch (Exception ex)
+                {
+                    if (IsEmptyResponseException(ex))
+                        throw new InvalidOperationException("Activation inconclusive: device returned '!empty' during verification.");
+                    throw;
+                }
+            }
+            catch (Exception ex)
+            {
+                // If connection fails, remove it from pool so a fresh one is created next time
+                _logger.LogWarning(ex, "❌ Operation failed on router {routerIP}, removing from connection pool", routerIP);
+                RemoveConnectionFromPool(routerIP);
+                throw;
+            }
         }
 
 
@@ -245,17 +597,13 @@ namespace MikrotikService.Services
 
             try
             {
-                loginCmd.ExecuteNonQuery();
+                SafeExecuteList(loginCmd);
                 Console.WriteLine("✅ User is now Active (forced login)");
             }
             catch (Exception ex)
             {
-                if (!IsEmptyResponseException(ex))
-                {
-                    Console.WriteLine($"❌ Forced login failed: {ex.Message}");
-                    throw;
-                }
-                Console.WriteLine("✅ Forced login completed with empty response (tik4net !empty case)");
+                Console.WriteLine($"❌ Forced login failed: {ex.Message}");
+                throw;
             }
         }
 
@@ -276,13 +624,14 @@ namespace MikrotikService.Services
                 try
                 {
                     _logger.LogInformation("🔄 [{routerName}] Attempting to move host to active for {username}...", routerName, username);
-                    using var connection = Connect(routerIP);
+                    var connection = GetOrCreateConnection(routerIP);
                     MoveHostToActive(connection, username, password, macAddress, ip);
                     _logger.LogInformation("✅ [{routerName}] Host moved to active for {username}", routerName, username);
                     return; // Success - exit the method
                 }
                 catch (Exception ex)
                 {
+                    RemoveConnectionFromPool(routerIP);
                     _logger.LogError(ex, "❌ [{routerName}] Failed to move host to active for {username}: {message}", routerName, username, ex.Message);
                     // Continue to next router
                 }
@@ -307,7 +656,7 @@ namespace MikrotikService.Services
                 try
                 {
                     _logger.LogInformation("🔄 [{routerName}] Attempting to deactivate user {username}...", routerName, username);
-                    using var connection = Connect(routerIP);
+                    var connection = GetOrCreateConnection(routerIP);
 
                     var users = connection.LoadList<HotspotUser>(connection.CreateParameter("name", username)).ToList();
 
@@ -341,6 +690,7 @@ namespace MikrotikService.Services
                 }
                 catch (Exception ex)
                 {
+                    RemoveConnectionFromPool(routerIP);
                     _logger.LogError(ex, "❌ [{routerName}] Failed to deactivate user {username}: {message}", routerName, username, ex.Message);
                     // Continue to next router
                 }
@@ -349,7 +699,7 @@ namespace MikrotikService.Services
             throw new Exception($"Failed to deactivate user {username} on any available router.");
         }
 
-        public void CreateUser(string username, string password)
+        public async Task CreateUser(string username, string password)
         {
             if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(password))
             {
@@ -365,10 +715,10 @@ namespace MikrotikService.Services
                 try
                 {
                     _logger.LogInformation("🔄 [{routerName}] Attempting to create user {username}...", routerName, username);
-                    using var connection = Connect(routerIP);
+                    var connection = GetOrCreateConnection(routerIP);
 
                     // Ensure the blocked profile exists
-                    EnsureProfileExistsOnConnection(connection, "profile-blocked");
+                    await EnsureProfileExistsOnConnectionAsync(connection, "profile-blocked").ConfigureAwait(false);
 
                     var addCommand = connection.CreateCommand("/ip/hotspot/user/add");
                     addCommand.AddParameter("name", username);
@@ -378,17 +728,8 @@ namespace MikrotikService.Services
 
                     // Try to add the user; if tik4net throws the known '!empty' response error,
                     // continue to verification step instead of failing immediately.
-                    try
-                    {
-                        addCommand.ExecuteNonQuery();
-                        _logger.LogInformation("✅ [{routerName}] User {username} created with blocked access and disabled until activation", routerName, username);
-                    }
-                    catch (Exception ex)
-                    {
-                        if (!IsEmptyResponseException(ex))
-                            throw;
-                        // fall through to verification
-                    }
+                    SafeExecuteList(addCommand);
+                    _logger.LogInformation("✅ [{routerName}] User {username} created with blocked access and disabled until activation", routerName, username);
 
                     // Verify the user exists. If verification fails with '!empty', consider it success.
                     try
@@ -413,6 +754,7 @@ namespace MikrotikService.Services
                 }
                 catch (Exception ex)
                 {
+                    RemoveConnectionFromPool(routerIP);
                     _logger.LogError(ex, "❌ [{routerName}] Failed to create user {username}: {message}", routerName, username, ex.Message);
                     // Continue to next router
                 }
@@ -437,7 +779,7 @@ namespace MikrotikService.Services
                 try
                 {
                     _logger.LogInformation("🔄 [{routerName}] Attempting to delete user {username}...", routerName, username);
-                    using var connection = Connect(routerIP);
+                    var connection = GetOrCreateConnection(routerIP);
 
                     var user = connection.LoadList<HotspotUser>(connection.CreateParameter("name", username)).FirstOrDefault();
                     if (user == null)
@@ -448,13 +790,14 @@ namespace MikrotikService.Services
 
                     var removeCommand = connection.CreateCommand("/ip/hotspot/user/remove");
                     removeCommand.AddParameter(".id", user.Id);
-                    removeCommand.ExecuteNonQuery();
+                    SafeExecuteList(removeCommand);
 
                     _logger.LogInformation("✅ [{routerName}] User {username} deleted successfully", routerName, username);
                     return; // Success - exit the method
                 }
                 catch (Exception ex)
                 {
+                    RemoveConnectionFromPool(routerIP);
                     if (IsEmptyResponseException(ex))
                     {
                         _logger.LogInformation("✅ [{routerName}] User {username} deletion verified (empty response)", routerName, username);
@@ -466,6 +809,54 @@ namespace MikrotikService.Services
             }
 
             throw new Exception($"Failed to delete user {username} on any available router.");
+        }
+
+        public Task UpdateUserPassword(string username, string newPassword)
+        {
+            if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(newPassword))
+            {
+                throw new ArgumentException("Username and new password are required");
+            }
+
+            // Try each router until one works
+            for (int i = 0; i < routerIPs.Length; i++)
+            {
+                string routerIP = routerIPs[i];
+                string routerName = routerNames.Length > i ? routerNames[i] : $"Router-{i}";
+
+                try
+                {
+                    _logger.LogInformation("🔄 [{routerName}] Attempting to update password for user {username}...", routerName, username);
+                    var connection = GetOrCreateConnection(routerIP);
+
+                    var user = connection.LoadList<HotspotUser>(connection.CreateParameter("name", username)).FirstOrDefault();
+                    if (user == null)
+                    {
+                        _logger.LogWarning("⚠️ [{routerName}] User {username} not found, trying next router...", routerName, username);
+                        continue; // Try next router
+                    }
+
+                    var setCommand = connection.CreateCommand("/ip/hotspot/user/set");
+                    setCommand.AddParameter(".id", user.Id);
+                    setCommand.AddParameter("password", newPassword);
+                    SafeExecuteList(setCommand);
+
+                    _logger.LogInformation("✅ [{routerName}] Password updated for user {username}", routerName, username);
+                    return Task.CompletedTask; // Success - exit the method
+                }
+                catch (Exception ex)
+                {
+                    if (IsEmptyResponseException(ex))
+                    {
+                        _logger.LogInformation("✅ [{routerName}] Password update verified for user {username} (empty response)", routerName, username);
+                        return Task.CompletedTask; // Success - exit the method
+                    }
+                    _logger.LogError(ex, "❌ [{routerName}] Failed to update password for user {username}: {message}", routerName, username, ex.Message);
+                    // Continue to next router
+                }
+            }
+
+            throw new Exception($"Failed to update password for user {username} on any available router.");
         }
 
         public void DisableUser(string username)
@@ -482,7 +873,7 @@ namespace MikrotikService.Services
                 try
                 {
                     _logger.LogInformation("🔄 [{routerName}] Attempting to disable user {username}...", routerName, username);
-                    using var connection = Connect(routerIP);
+                    var connection = GetOrCreateConnection(routerIP);
 
                     var users = connection.LoadList<HotspotUser>(connection.CreateParameter("name", username)).ToList();
 
@@ -493,13 +884,21 @@ namespace MikrotikService.Services
                     }
 
                     var user = users.First();
+                    _logger.LogInformation("🔍 [{routerName}] Found user {username} with ID: '{userId}'", routerName, username, user.Id ?? "null");
+                    if (string.IsNullOrWhiteSpace(user.Id))
+                    {
+                        _logger.LogError("❌ [{routerName}] Cannot disable user {username}: missing MikroTik internal .id", routerName, username);
+                        throw new InvalidOperationException($"Hotspot user '{username}' has no internal .id on router {routerName}.");
+                    }
+
                     var setCommand = connection.CreateCommand("/ip/hotspot/user/set");
-                    setCommand.AddParameter(".id", user.Id);
+                    setCommand.AddParameter(".id", user.Id); // MUST be first for /set operations
+                    _logger.LogInformation("   🔧 Executing disable set with .id={userId}", user.Id);
                     setCommand.AddParameter("disabled", "yes");
 
                     try
                     {
-                        setCommand.ExecuteNonQuery();
+                        setCommand.ExecuteList();
                         _logger.LogInformation("✅ [{routerName}] User {username} disabled successfully", routerName, username);
                     }
                     catch (Exception ex)
@@ -519,6 +918,7 @@ namespace MikrotikService.Services
                 }
                 catch (Exception ex)
                 {
+                    RemoveConnectionFromPool(routerIP);
                     if (IsEmptyResponseException(ex))
                     {
                         _logger.LogInformation("✅ [{routerName}] User {username} disable verified (empty response)", routerName, username);
@@ -543,13 +943,14 @@ namespace MikrotikService.Services
                 try
                 {
                     _logger.LogInformation("🔄 [{routerName}] Testing connection...", routerName);
-                    using var connection = Connect(routerIP);
+                    var connection = GetOrCreateConnection(routerIP);
                     var identity = connection.LoadAll<SystemIdentity>().First();
                     _logger.LogInformation("✅ [{routerName}] Connection test successful: {identity}", routerName, identity.Name);
                     return new { connected = true, identity = identity.Name, router = routerName };
                 }
                 catch (Exception ex)
                 {
+                    RemoveConnectionFromPool(routerIP);
                     _logger.LogError(ex, "❌ [{routerName}] Connection test failed: {message}", routerName, ex.Message);
                     // Continue to next router
                 }
@@ -569,13 +970,14 @@ namespace MikrotikService.Services
                 try
                 {
                     _logger.LogInformation("🔄 [{routerName}] Attempting to list hotspot users...", routerName);
-                    using var connection = Connect(routerIP);
+                    var connection = GetOrCreateConnection(routerIP);
                     var users = connection.LoadAll<HotspotUser>().ToList();
                     _logger.LogInformation("✅ [{routerName}] Retrieved {count} hotspot users", routerName, users.Count);
                     return users;
                 }
                 catch (Exception ex)
                 {
+                    RemoveConnectionFromPool(routerIP);
                     _logger.LogError(ex, "❌ [{routerName}] Failed to list hotspot users: {message}", routerName, ex.Message);
                     // Continue to next router
                 }
@@ -584,7 +986,7 @@ namespace MikrotikService.Services
             throw new Exception("Failed to list hotspot users from any available router.");
         }
 
-        public HotspotUser GetUserDetails(string username)
+        public HotspotUser? GetUserDetails(string username)
         {
             if (string.IsNullOrWhiteSpace(username))
             {
@@ -600,7 +1002,7 @@ namespace MikrotikService.Services
                 try
                 {
                     _logger.LogInformation("🔄 [{routerName}] Attempting to get user details for {username}...", routerName, username);
-                    using var connection = Connect(routerIP);
+                    var connection = GetOrCreateConnection(routerIP);
 #pragma warning disable CS8603
                     var user = connection.LoadList<HotspotUser>(connection.CreateParameter("name", username)).FirstOrDefault();
 #pragma warning restore CS8603
@@ -617,6 +1019,7 @@ namespace MikrotikService.Services
                 }
                 catch (Exception ex)
                 {
+                    RemoveConnectionFromPool(routerIP);
                     _logger.LogError(ex, "❌ [{routerName}] Failed to get user details for {username}: {message}", routerName, username, ex.Message);
                     // Continue to next router
                 }
@@ -636,13 +1039,14 @@ namespace MikrotikService.Services
                 try
                 {
                     _logger.LogInformation("🔄 [{routerName}] Attempting to get active users...", routerName);
-                    using var connection = Connect(routerIP);
+                    var connection = GetOrCreateConnection(routerIP);
                     var activeUsers = connection.LoadAll<HotspotActive>().ToList();
                     _logger.LogInformation("✅ [{routerName}] Retrieved {count} active users", routerName, activeUsers.Count);
                     return activeUsers;
                 }
                 catch (Exception ex)
                 {
+                    RemoveConnectionFromPool(routerIP);
                     _logger.LogError(ex, "❌ [{routerName}] Failed to get active users: {message}", routerName, ex.Message);
                     // Continue to next router
                 }
@@ -665,7 +1069,7 @@ namespace MikrotikService.Services
                 try
                 {
                     _logger.LogInformation("🔄 [{routerName}] Attempting to bind MAC {macAddress} to bypass...", routerName, macAddress);
-                    using var connection = Connect(routerIP);
+                    var connection = GetOrCreateConnection(routerIP);
 
                     // Check if binding already exists
                     var existingBindings = connection.LoadList<dynamic>(
@@ -713,6 +1117,7 @@ namespace MikrotikService.Services
                 }
                 catch (Exception ex)
                 {
+                    RemoveConnectionFromPool(routerIP);
                     _logger.LogError(ex, "❌ [{routerName}] Failed to bind MAC {macAddress} to bypass: {message}", routerName, macAddress, ex.Message);
                     // Continue to next router
                 }
@@ -735,7 +1140,7 @@ namespace MikrotikService.Services
                 try
                 {
                     _logger.LogInformation("🔄 [{routerName}] Attempting to unbind MAC {macAddress}...", routerName, macAddress);
-                    using var connection = Connect(routerIP);
+                    var connection = GetOrCreateConnection(routerIP);
 
                     // Find and remove the binding
                     var bindings = connection.LoadList<dynamic>(
@@ -768,6 +1173,7 @@ namespace MikrotikService.Services
                 }
                 catch (Exception ex)
                 {
+                    RemoveConnectionFromPool(routerIP);
                     _logger.LogError(ex, "❌ [{routerName}] Failed to unbind MAC {macAddress}: {message}", routerName, macAddress, ex.Message);
                     // Continue to next router
                 }
@@ -780,7 +1186,7 @@ namespace MikrotikService.Services
         /// FAILOVER METHOD: Tries to activate a user on the first available router (Home then School)
         /// Used for the "mobile Starlink" scenario where only one router is online at a time
         /// </summary>
-        public string ActivateOnAvailableRouter(string username, int durationHours, string? macAddress = null)
+        public async Task<string> ActivateOnAvailableRouter(string username, int durationHours, string? macAddress = null)
         {
             _logger.LogInformation("🚀 ActivateOnAvailableRouter START: username={username}, duration={durationHours}h, mac={macAddress}", username, durationHours, macAddress ?? "null");
             
@@ -790,29 +1196,24 @@ namespace MikrotikService.Services
             List<string> errors = new List<string>();
             string? successfulRouter = null;
 
-            // Try each router in order
-            for (int i = 0; i < routerIPs.Length; i++)
+            foreach (var candidate in GetRouterAttemptOrder())
             {
-                string routerIP = routerIPs[i];
-                string routerName = routerNames.Length > i ? routerNames[i] : $"Router-{i}";
-
-                _logger.LogInformation("🔄 [{routerName}] Attempting to activate {username}...", routerName, username);
+                bool isStickyCandidate = candidate.routerIP == _activeRouterIp;
+                _logger.LogInformation("🔄 [{routerName}] Attempting to activate {username}...", candidate.routerName, username);
 
                 try
                 {
-                    using var connection = ConnectToRouter(routerIP);
-                    _logger.LogInformation("✅ [{routerName}] Connected successfully", routerName);
-                    
-                    // Try to activate the user
-                    _logger.LogInformation("   Step 1/2: Creating/updating hotspot user...");
-                    ActivateUserOnConnection(connection, username, durationHours);
-                    _logger.LogInformation("   ✅ Hotspot user ready");
-                    
-                    // If we get here, connection was successful
-                    successfulRouter = routerName;
-                    _logger.LogInformation("✅ [{routerName}] Successfully activated {username}", routerName, username);
+                    var connection = GetOrCreateConnection(candidate.routerIP);
+                    SetActiveRouter(candidate.routerIP);
+                    _logger.LogInformation("✅ [{routerName}] Connected successfully", candidate.routerName);
 
-                    // If MAC address provided, also bind it
+                    _logger.LogInformation("   Step 1/2: Creating/updating hotspot user...");
+                    await ActivateUserOnConnection(connection, username, durationHours).ConfigureAwait(false);
+                    _logger.LogInformation("   ✅ Hotspot user ready");
+
+                    successfulRouter = candidate.routerName;
+                    _logger.LogInformation("✅ [{routerName}] Successfully activated {username}", candidate.routerName, username);
+
                     if (!string.IsNullOrWhiteSpace(macAddress))
                     {
                         try
@@ -824,23 +1225,29 @@ namespace MikrotikService.Services
                         catch (Exception macError)
                         {
                             _logger.LogWarning("⚠️ MAC binding warning (non-critical): {message}", macError.Message);
-                            // Don't fail activation if MAC binding fails
                         }
                     }
 
-                    _logger.LogInformation("🚀 ActivateOnAvailableRouter SUCCESS on {routerName}", routerName);
-                    return successfulRouter;
+                    _logger.LogInformation("🚀 ActivateOnAvailableRouter SUCCESS on {routerName}", candidate.routerName);
+                    return successfulRouter!;
                 }
                 catch (Exception ex)
                 {
-                    string errorMsg = $"{routerName} ({routerIP}): {ex.Message}";
-                    errors.Add(errorMsg);
-                    _logger.LogError(ex, "❌ [{routerName}] Activation failed: {message}", routerName, ex.Message);
-                    // Continue to next router
+                    if (isStickyCandidate)
+                    {
+                        _logger.LogWarning(ex, "⚠️ Sticky router {routerIP} failed, clearing cache and trying next router...", candidate.routerIP);
+                        ClearActiveRouterCache();
+                    }
+                    else
+                    {
+                        _logger.LogError(ex, "❌ [{routerName}] Activation failed: {message}", candidate.routerName, ex.Message);
+                    }
+
+                    errors.Add($"{candidate.routerName} ({candidate.routerIP}): {ex.Message}");
+                    continue;
                 }
             }
 
-            // If we get here, all routers failed
             string allErrors = string.Join("; ", errors);
             _logger.LogError("❌ Failed to activate {username} on any available router. Errors: {errors}", username, allErrors);
             throw new Exception(
@@ -854,7 +1261,7 @@ namespace MikrotikService.Services
         /// Recipient will log in manually; MAC will be captured on first login
         /// Used when one user buys a bundle for another user
         /// </summary>
-        public string CreateHotspotUserOnly(string username, int durationHours)
+        public async Task<string> CreateHotspotUserOnly(string username, int durationHours)
         {
             if (string.IsNullOrWhiteSpace(username))
                 throw new ArgumentException("Username is required");
@@ -872,10 +1279,10 @@ namespace MikrotikService.Services
                 {
                     Console.WriteLine($"🎁 Attempting to create hotspot user {username} on {routerName} ({routerIP})...");
                     
-                    using var connection = ConnectToRouter(routerIP);
+                    var connection = GetOrCreateConnection(routerIP);
                     
                     // Try to activate the user (creates hotspot account with limit-uptime)
-                    ActivateUserOnConnection(connection, username, durationHours);
+                    await ActivateUserOnConnection(connection, username, durationHours).ConfigureAwait(false);
                     
                     // If we get here, connection was successful
                     successfulRouter = routerName;
@@ -905,7 +1312,7 @@ namespace MikrotikService.Services
         /// This moves the user from 'Hosts' to 'Active' on the MikroTik hotspot
         /// Used for automatic authentication after payment or web login
         /// </summary>
-        public string SilentLogin(string username, string password, string mac, string ip, int durationHours)
+        public async Task<string> SilentLogin(string username, string password, string mac, string ip, int durationHours)
         {
             Console.WriteLine($"🔐 ===== SILENT LOGIN START =====");
             Console.WriteLine($"🔐 Username: {username}");
@@ -931,21 +1338,22 @@ namespace MikrotikService.Services
 
                 try
                 {
-                    using var connection = ConnectToRouter(routerIP);
+                    var connection = GetOrCreateConnection(routerIP);
                     Console.WriteLine($"✅ Connected to {routerName}");
 
                     // 1. Create/Update the Hotspot User first (so they exist in the DB)
                     Console.WriteLine($"   1️⃣ Creating/updating hotspot user...");
-                    ActivateUserOnConnection(connection, username, durationHours);
+                    await ActivateUserOnConnection(connection, username, durationHours).ConfigureAwait(false);
                     Console.WriteLine($"   ✅ Hotspot user ready");
 
                     // 2. FORCE the login session for this specific device
                     // This makes the MikroTik move the user from 'Hosts' to 'Active'
                     Console.WriteLine($"   2️⃣ Forcing login session (user: {username}, mac: {mac}, ip: {ip})...");
-                    MoveHostToActive(username, password, mac, ip);
+                    MoveHostToActive(connection, username, password, mac, ip);
                     Console.WriteLine($"   ✅ Login session forced successfully by MoveHostToActive");
 
                     // If we get here, login was successful
+                    SetActiveRouter(routerIP);
                     successfulRouter = routerName;
                     Console.WriteLine($"✅ Silent login successful for {username} on {routerName}");
                     Console.WriteLine($"🔐 ===== SILENT LOGIN SUCCESS =====");
@@ -988,7 +1396,7 @@ namespace MikrotikService.Services
                 {
                     _logger.LogInformation("🔄 [{routerName}] Attempting to bind MAC {macAddress}...", routerName, macAddress);
                     
-                    using var connection = ConnectToRouter(routerIP);
+                    var connection = GetOrCreateConnection(routerIP);
                     _logger.LogInformation("✅ [{routerName}] Connected successfully", routerName);
                     
                     // Try to bind the MAC
@@ -1037,7 +1445,7 @@ namespace MikrotikService.Services
                 try
                 {
                     Console.WriteLine($"🔄 [{routerName}] Searching for MAC binding...");
-                    using var connection = ConnectToRouter(routerIP);
+                    var connection = GetOrCreateConnection(routerIP);
                     
                     // Try to find and remove the binding using raw command instead of LoadList
                     // (LoadList fails due to HotspotIpBinding not having TikEntityAttribute)
@@ -1119,7 +1527,7 @@ namespace MikrotikService.Services
                         
                         var removeCmd = connection.CreateCommand("/ip/hotspot/active/remove");
                         removeCmd.AddParameter(".id", sessionId);
-                        removeCmd.ExecuteNonQuery();
+                        SafeExecuteList(removeCmd);
                         
                         _logger.LogInformation("   ✅ Active session {sessionId} removed for {username}", sessionId, username);
                         foundSession = true;
@@ -1145,7 +1553,7 @@ namespace MikrotikService.Services
             }
         }
 
-        private void ActivateUserOnConnection(ITikConnection connection, string username, int durationHours)
+        private async Task ActivateUserOnConnection(ITikConnection connection, string username, int durationHours)
         {
             _logger.LogInformation("   📋 ActivateUserOnConnection: user={username}, duration={durationHours}h", username, durationHours);
             
@@ -1171,7 +1579,7 @@ namespace MikrotikService.Services
             _logger.LogInformation("   ⏱️ Using profile: {profile}", profile);
             
             // Ensure the requested profile exists 
-            EnsureProfileExistsOnConnection(connection, profile);
+            await EnsureProfileExistsOnConnectionAsync(connection, profile).ConfigureAwait(false);
             
             // Execute set or add
             if (users.Count > 0)
@@ -1207,6 +1615,7 @@ namespace MikrotikService.Services
                 }
 
                 var setCommand = connection.CreateCommand("/ip/hotspot/user/set");
+                // Use .id parameter for set command (required by MikroTik API)
                 setCommand.AddParameter(".id", user.Id);
                 setCommand.AddParameter("profile", profile);
                 setCommand.AddParameter("limit-uptime", $"{durationHours}h");
@@ -1215,7 +1624,7 @@ namespace MikrotikService.Services
                 try
                 {
                     _logger.LogInformation("   ⚙️ Executing SET command for user {username}", username);
-                    setCommand.ExecuteNonQuery();
+                    setCommand.ExecuteList();
                     _logger.LogInformation("   ✅ User updated successfully with new duration {durationHours}h", durationHours);
                 }
                 catch (Exception ex)
@@ -1235,18 +1644,9 @@ namespace MikrotikService.Services
                 addCommand.AddParameter("profile", profile);
                 addCommand.AddParameter("limit-uptime", $"{durationHours}h");
 
-                try
-                {
-                    _logger.LogInformation("   ⚙️ Executing ADD command for user {username}", username);
-                    addCommand.ExecuteNonQuery();
-                    _logger.LogInformation("   ✅ User created successfully");
-                }
-                catch (Exception ex)
-                {
-                    if (!IsEmptyResponseException(ex))
-                        throw;
-                    _logger.LogInformation("   ℹ️ ADD command returned empty response (expected)");
-                }
+                _logger.LogInformation("   ⚙️ Executing ADD command for user {username}", username);
+                SafeExecuteList(addCommand);
+                _logger.LogInformation("   ✅ User created successfully");
             }
 
             // Verification
@@ -1294,18 +1694,9 @@ namespace MikrotikService.Services
                     Console.WriteLine($"   🗑️ Removing old binding (ID: {bindingId})...");
                     var removeCommand = connection.CreateCommand("/ip/hotspot/ip-binding/remove");
                     removeCommand.AddParameter(".id", bindingId);
-                    try
-                    {
-                        Console.WriteLine("   ⚙️ Executing REMOVE command for old binding");
-                        removeCommand.ExecuteNonQuery();
-                        Console.WriteLine("   ✅ Old binding removed successfully");
-                    }
-                    catch (Exception ex)
-                    {
-                        if (!IsEmptyResponseException(ex))
-                            throw;
-                        Console.WriteLine("   ℹ️ Old binding removed with empty response");
-                    }
+                    Console.WriteLine("   ⚙️ Executing REMOVE command for old binding");
+                    SafeExecuteList(removeCommand);
+                    Console.WriteLine("   ✅ Old binding removed successfully");
                 }
 
                 // Add new binding with bypass type
@@ -1318,18 +1709,9 @@ namespace MikrotikService.Services
                     addCommand.AddParameter("timeout", $"{durationHours}h");
                 }
 
-                try
-                {
-                    Console.WriteLine("   ⚙️ Executing ADD command for new binding");
-                    addCommand.ExecuteNonQuery();
-                    Console.WriteLine("   ✅ New binding created successfully");
-                }
-                catch (Exception ex)
-                {
-                    if (!IsEmptyResponseException(ex))
-                        throw;
-                    Console.WriteLine("   ℹ️ New binding created with empty response");
-                }
+                Console.WriteLine("   ⚙️ Executing ADD command for new binding");
+                SafeExecuteList(addCommand);
+                Console.WriteLine("   ✅ New binding created successfully");
             }
             catch (Exception ex)
             {
@@ -1341,7 +1723,7 @@ namespace MikrotikService.Services
         /// <summary>
         /// Helper method: Ensure profile exists on a given connection
         /// </summary>
-        private void EnsureProfileExistsOnConnection(ITikConnection connection, string profileName)
+        private async Task EnsureProfileExistsOnConnectionAsync(ITikConnection connection, string profileName)
         {
             if (connection == null || string.IsNullOrWhiteSpace(profileName))
                 return;
@@ -1394,8 +1776,10 @@ namespace MikrotikService.Services
                     }
                 }
                 
-                addProfile.ExecuteNonQuery();
+                SafeExecuteList(addProfile);
                 _logger.LogInformation("   ✅ Profile created successfully");
+
+                await Task.Delay(1000).ConfigureAwait(false);
 
                 if (!HotspotProfileExists(connection, profileName))
                 {
@@ -1415,6 +1799,11 @@ namespace MikrotikService.Services
                 _logger.LogError("   ❌ Error ensuring profile exists: {error}", ex.Message);
                 throw;
             }
+        }
+
+        private void EnsureProfileExistsOnConnection(ITikConnection connection, string profileName)
+        {
+            EnsureProfileExistsOnConnectionAsync(connection, profileName).GetAwaiter().GetResult();
         }
 
         private bool HotspotProfileExists(ITikConnection connection, string profileName)
